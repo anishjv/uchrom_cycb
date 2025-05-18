@@ -8,10 +8,11 @@ from typing import Tuple, List, Optional
 import skimage
 from skimage.morphology import (
     binary_dilation,
+    binary_erosion,
     disk,
-    square,
+    rectangle,
     remove_small_holes,
-    remove_small_objects
+    remove_small_objects,
 )
 from skimage.filters import threshold_otsu, gaussian
 from skimage.measure import label, regionprops
@@ -20,11 +21,14 @@ from skimage.restoration import unsupervised_wiener, richardson_lucy
 import warnings
 import tempfile
 import tifffile as tiff
-import os 
+import os
 import subprocess
+import matplotlib.pyplot as plt
 
 
-def adjust_zoom_factor(chromatin_shape: tuple[int, int, int], instance_shape: tuple[int, int, int]) -> float:
+def adjust_zoom_factor(
+    chromatin_shape: tuple[int, int, int], instance_shape: tuple[int, int, int]
+) -> float:
     """
     Adjust zoom factor based on input shapes.
     ---------------------------------------------------------------------------------------------------------------
@@ -35,13 +39,18 @@ def adjust_zoom_factor(chromatin_shape: tuple[int, int, int], instance_shape: tu
         zoom_factor: float
     """
     try:
-        assert chromatin_shape[1] / instance_shape[1] == chromatin_shape[2] / instance_shape[2]
+        assert (
+            chromatin_shape[1] / instance_shape[1]
+            == chromatin_shape[2] / instance_shape[2]
+        )
         return chromatin_shape[2] / instance_shape[2]
     except AssertionError:
         raise ValueError("Chromatin and Instance must be square arrays")
 
 
-def prepare_cell_image(chromatin: np.ndarray, frame: int, bbox_coords: tuple[int, int, int, int]) -> np.ndarray:
+def prepare_cell_image(
+    chromatin: np.ndarray, frame: int, bbox_coords: tuple[int, int, int, int]
+) -> np.ndarray:
     """
     Prepares the cell image by cropping and applying top-hat filtering and gaussian smoothing.
     ---------------------------------------------------------------------------------------------------------------
@@ -55,11 +64,16 @@ def prepare_cell_image(chromatin: np.ndarray, frame: int, bbox_coords: tuple[int
     """
     rmin, rmax, cmin, cmax = bbox_coords
     cell = chromatin[frame, rmin:rmax, cmin:cmax]
-    nobkg_cell = skimage.morphology.white_tophat(cell, disk(5))
-    return cell, gaussian(nobkg_cell, sigma=1.5)
+    cell = remove_border_objs(cell)
+
+    nobkg_cell = skimage.morphology.white_tophat(cell, disk(11))
+
+    return cell, nobkg_cell
 
 
-def get_largest_signal_regions(nobkg_cell, cell: np.ndarray, num_regions: int = 1) -> tuple[list[regionprops], np.ndarray]:
+def get_largest_signal_regions(
+    nobkg_cell, cell: np.ndarray, num_regions: int = 1
+) -> tuple[list[regionprops], np.ndarray]:
     """
     Segments the cell and returns the brightest regions.
     ---------------------------------------------------------------------------------------------------------------
@@ -70,25 +84,27 @@ def get_largest_signal_regions(nobkg_cell, cell: np.ndarray, num_regions: int = 
         sorted_regions: List[regionprops]
         labeled: np.ndarray
     """
-    thresh = threshold_otsu(nobkg_cell) #
-    labeled, num_labels = label(nobkg_cell > thresh, return_num=True, connectivity=1)
+    thresh = threshold_otsu(nobkg_cell)
+    thresh_cell = nobkg_cell > thresh
+    labeled, num_labels = label(thresh_cell, return_num=True, connectivity=1)
     labels = np.linspace(1, num_labels, num_labels).astype(int)
     region_intensities = [np.nansum(cell[labeled == (lbl)]) for lbl in labels]
+    if len(region_intensities) == 0:
+        return labeled, None, None, 1
+    
     max_intensity = max(region_intensities)
     max_intensity_lbl = labels[region_intensities.index(max_intensity)]
-    
+
     if len(region_intensities) > 1:
         second_max_intensity = sorted(region_intensities)[-2]
-        nxt_max_intensity_lbl = labels[
-                    region_intensities.index(second_max_intensity)
-                ]
-        
+        nxt_max_intensity_lbl = labels[region_intensities.index(second_max_intensity)]
+
         intensity_diff_ratio = (max_intensity - second_max_intensity) / max_intensity
-        
+
     else:
         nxt_max_intensity_lbl = None
-        intensity_diff_ratio = 1        
-        
+        intensity_diff_ratio = 1
+
     return labeled, max_intensity_lbl, nxt_max_intensity_lbl, intensity_diff_ratio
 
 
@@ -108,7 +124,7 @@ def remove_regions(labels: list[int], labeled: np.ndarray) -> np.ndarray:
     return binary_dilation(removal_mask, disk(9))
 
 
-def remove_metaphase_if_eccentric(lbl:int, labeled: np.ndarray) -> np.ndarray:
+def remove_metaphase_if_eccentric(lbl: int, labeled: np.ndarray) -> np.ndarray:
     """
     Removes the metaphase plate only if its eccentricity exceeds threshold.
     ---------------------------------------------------------------------------------------------------------------
@@ -120,16 +136,21 @@ def remove_metaphase_if_eccentric(lbl:int, labeled: np.ndarray) -> np.ndarray:
     """
     region_mask = np.zeros_like(labeled, dtype=bool)
     region_mask[labeled == lbl] = 1
-    eccentricity = regionprops(label(region_mask.astype(int)))[0].eccentricity
-    if eccentricity > 0.7:
-        print('metaphase; removing plate')
+    props = regionprops(label(region_mask.astype(int)))[0]
+    eccentricity = props.eccentricity
+    euler_number = props.euler_number
+
+    if eccentricity > 0.8 and euler_number > -5:
+        print("metaphase; removing plate")
         return binary_dilation(region_mask, disk(9))
     else:
-        print('metaphase; NOT removing plate')
+        print("metaphase; NOT removing plate")
         return np.zeros_like(labeled, dtype=bool)
 
 
-def segment_unaligned_chromosomes(cell: np.ndarray, removal_mask: np.ndarray, min_area: int) -> tuple[int, int, int]:
+def segment_unaligned_chromosomes(
+    cell: np.ndarray, removal_mask: np.ndarray, min_area: int
+) -> tuple[int, int, int]:
     """
     Segments and measures properties of unaligned chromosomes.
     ---------------------------------------------------------------------------------------------------------------
@@ -145,23 +166,25 @@ def segment_unaligned_chromosomes(cell: np.ndarray, removal_mask: np.ndarray, mi
     perfect_psf = np.zeros((19, 19))
     perfect_psf[9, 9] = 1
     psf = gaussian(perfect_psf, 2)
+    # cell = remove_border_objs(cell)
     deconv_cell = unsupervised_wiener(cell, psf, clip=False)[0]
     cell_minus_struct = np.copy(deconv_cell)
     cell_minus_struct[removal_mask] = 0
-    
+
     thresh = threshold_otsu(cell_minus_struct)
-    labeled, num_labels = label(cell_minus_struct > thresh, return_num=True, connectivity=1)
+    labeled, num_labels = label(
+        cell_minus_struct > thresh, return_num=True, connectivity=1
+    )
     labels = np.linspace(1, num_labels, num_labels).astype(int)
     labeled = clear_border(labeled)
-    
+
     areas, intensities = [], []
     for lbl in labels:
         area = np.nansum(labeled[labeled == lbl])
         if area >= min_area:
-            intensity = np.nansum(cell[labeled==lbl])
+            intensity = np.nansum(cell[labeled == lbl])
             areas.append(area)
             intensities.append(intensity)
-                
 
     return np.nansum(areas), np.nansum(intensities), len(areas)
 
@@ -183,8 +206,8 @@ def measure_whole_cell(cell: np.ndarray) -> tuple[int, float, float]:
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", category=RuntimeWarning)
         mean = np.nanmean(cell[mask])
-    
-    return np.nansum(mask),np.nansum(cell[mask]), mean
+
+    return np.nansum(mask), np.nansum(cell[mask]), mean
 
 
 def unaligned_chromatin(
@@ -192,7 +215,7 @@ def unaligned_chromatin(
     analysis_df: pd.DataFrame,
     instance: np.ndarray,
     chromatin: np.ndarray,
-    min_chromatin_area: Optional[int] = 4
+    min_chromatin_area: Optional[int] = 4,
 ) -> tuple[list[int], list[int], list[float], list[int], list[float], list[int], int]:
     """
     Given an image capturing histone fluoresence, returns the area emitting of signal emitting regions minus the
@@ -219,10 +242,14 @@ def unaligned_chromatin(
 
     results = []
     anaphase_indices = []
-    print(f'Working on cell {identity}')
-    
+    print(f"Working on cell {identity}")
+
     for idx, row in frames_data.iterrows():
-        f, l, semantic = int(row["frame"]), int(row["label"]), int(row["semantic_smoothed"])
+        f, l, semantic = (
+            int(row["frame"]),
+            int(row["label"]),
+            int(row["semantic_smoothed"]),
+        )
 
         mask = instance[f] == l
         if zoom_factor != 1:
@@ -233,18 +260,28 @@ def unaligned_chromatin(
         cell, nobkg_cell = prepare_cell_image(chromatin, f, bbox_coords)
 
         if semantic == 1:
-            labeled_regions, max_lbl, second_lbl, intensity_diff_ratio = get_largest_signal_regions(nobkg_cell, cell, num_regions=2)
+            labeled_regions, max_lbl, second_lbl, intensity_diff_ratio = (
+                get_largest_signal_regions(nobkg_cell, cell, num_regions=2)
+            )
+
+            if max_lbl == None:
+                print("Lost track of cell! Moving on to next cell")
+                return ([], [], [], [], [], [], None)
 
             if second_lbl:
-                to_check = idx+9 if (idx+9) < len(semantics) else -1
-                near_end_of_mitosis = any(s == 0 for s in semantics[idx:to_check]) 
-                
-                if intensity_diff_ratio < (1 / 3) and near_end_of_mitosis:
-                    print('anaphase; removing blobs')
-                    removal_mask = remove_regions([max_lbl, second_lbl], labeled_regions)
+                to_check = idx + 9 if (idx + 9) < len(semantics) else -1
+                near_end_of_mitosis = any(s == 0 for s in semantics[idx:to_check])
+
+                if intensity_diff_ratio < (1/2) and near_end_of_mitosis:
+                    print("anaphase; removing blobs")
+                    removal_mask = remove_regions(
+                        [max_lbl, second_lbl], labeled_regions
+                    )
                     anaphase_indices.append(idx)
                 else:
-                    removal_mask = remove_metaphase_if_eccentric(max_lbl, labeled_regions)
+                    removal_mask = remove_metaphase_if_eccentric(
+                        max_lbl, labeled_regions
+                    )
             else:
                 removal_mask = remove_metaphase_if_eccentric(max_lbl, labeled_regions)
 
@@ -262,15 +299,33 @@ def unaligned_chromatin(
                 # anaphase may not be detected due to finite temporal resolution
                 first_anaphase = None
 
-            area_sig, int_sig, num_sig = segment_unaligned_chromosomes(cell, removal_mask, min_chromatin_area)
+            area_sig, int_sig, num_sig = segment_unaligned_chromosomes(
+                cell, removal_mask, min_chromatin_area
+            )
         else:
             area_sig, int_sig, num_sig = 0, 0, 0
 
         whole_area, whole_intensity, whole_avg_intensity = measure_whole_cell(cell)
 
-        results.append((area_sig, int_sig, whole_intensity, num_sig, whole_avg_intensity, whole_area))
-        
-    area_signal, intensity_signal, whole_cell_intensity, num_signals, whole_cell_avg_intensity, whole_cell_area = zip(*results)
+        results.append(
+            (
+                area_sig,
+                int_sig,
+                whole_intensity,
+                num_sig,
+                whole_avg_intensity,
+                whole_area,
+            )
+        )
+
+    (
+        area_signal,
+        intensity_signal,
+        whole_cell_intensity,
+        num_signals,
+        whole_cell_avg_intensity,
+        whole_cell_area,
+    ) = zip(*results)
 
     return (
         list(area_signal),
@@ -282,24 +337,167 @@ def unaligned_chromatin(
         first_anaphase,
     )
 
-def bbox(img: npt.NDArray) -> tuple[int]:
-    """
-    Returns the minimum bounding box of a boolean array containing one region of True values
-    ------------------------------------------------------------------------------------------
-    INPUTS:
-        img: npt.NDArray
-    OUTPUTS:
-        rmin: float, lower row index
-        rmax: float, upper row index
-        cmin: float, lower column index
-        cmax: float, upper column index
-    """
-    rows = np.any(img, axis=1)
-    cols = np.any(img, axis=0)
-    rmin, rmax = np.where(rows)[0][[0, -1]]
-    cmin, cmax = np.where(cols)[0][[0, -1]]
 
-    return rmin, rmax, cmin, cmax
+def extract_montages(
+    identity: int,
+    analysis_df: pd.DataFrame,
+    instance: npt.NDArray,
+    chromatin: npt.NDArray,
+    cmap: Optional[str] = None,
+    well_pos: Optional[str] = None,
+    save_path: Optional[str] = None,
+    mode: Optional[str] = "seg",
+):
+    """
+    Function for saving montages of ROIs
+    ------------------------------------
+    INPUTS:
+        identity: int,
+        analysis_df: pd.DataFrame.
+        instance: npt.NDArray,
+        chromatin: npt.NDArray,
+        well_pos: str,
+        save_path:str
+    TODO:
+        color masks by area extracted
+    """
+
+    zoom_factor = adjust_zoom_factor(chromatin.shape, instance.shape)
+
+    rois = []
+    anaphase_indices = []
+    frames = analysis_df.query(f"particle=={identity}")["frame"].tolist()
+    markers = analysis_df.query(f"particle=={identity}")["label"].tolist()
+    semantics = analysis_df.query(f"particle=={identity}")["semantic_smoothed"].tolist()
+
+    for idx, zipped in enumerate(zip(frames, markers, semantics)):
+
+        f, l, classifier = zipped
+        # expand mask and capture indices
+        mask = instance[f, :, :] == l
+        if zoom_factor != 1:
+            mask = zoom(mask, zoom_factor, order=0)
+        zoom_mask = binary_dilation(mask, skimage.morphology.disk(3))
+        bbox_coords = bbox(zoom_mask)
+
+        # trim cell and mask for efficiency
+        cell, nobkg_cell = prepare_cell_image(chromatin, f, bbox_coords)
+        if mode != "cell":
+            if classifier == 1:
+                labeled_regions, max_lbl, second_lbl, intensity_diff_ratio = (
+                    get_largest_signal_regions(nobkg_cell, cell, num_regions=2)
+                )
+
+                if second_lbl:
+                    to_check = idx + 9 if (idx + 9) < len(semantics) else -1
+                    near_end_of_mitosis = any(s == 0 for s in semantics[idx:to_check])
+
+                    if intensity_diff_ratio < (1 / 3) and near_end_of_mitosis:
+                        print("anaphase; removing blobs")
+                        removal_mask = remove_regions(
+                            [max_lbl, second_lbl], labeled_regions
+                        )
+                        anaphase_indices.append(idx)
+                    else:
+                        removal_mask = remove_metaphase_if_eccentric(
+                            max_lbl, labeled_regions
+                        )
+                else:
+                    removal_mask = remove_metaphase_if_eccentric(
+                        max_lbl, labeled_regions
+                    )
+
+                if len(anaphase_indices) > 0:
+                    consecutives = np.split(
+                        anaphase_indices,
+                        np.where(np.diff(anaphase_indices) != 1)[0] + 1,
+                    )
+                    for sublist in consecutives:
+                        if len(sublist) > 1:
+                            first_anaphase = sublist[0]
+                            break
+                        else:
+                            first_anaphase = anaphase_indices[0]
+                else:
+                    # anaphase may not be detected due to finite temporal resolution
+                    first_anaphase = None
+
+                area_sig, int_sig, num_sig = segment_unaligned_chromosomes(
+                    cell, removal_mask, 5
+                )
+
+                perfect_psf = np.zeros((19, 19))
+                perfect_psf[9, 9] = 1
+                psf = gaussian(perfect_psf, 2)
+                deconv_cell = unsupervised_wiener(cell, psf, clip=False)[0]
+                cell_minus_struct = np.copy(deconv_cell)
+                cell_minus_struct[removal_mask] = 0
+
+                thresh = threshold_otsu(cell_minus_struct)
+                thresh_cell = cell_minus_struct > thresh
+                labeled, num_labels = label(
+                    thresh_cell, return_num=True, connectivity=1
+                )
+                labeled = clear_border(labeled) > 0
+                borders = binary_dilation(labeled) ^ binary_erosion(labeled)
+                with_borders = np.copy(cell)
+                with_borders[borders] = 0
+
+                rois.append(with_borders)
+
+            else:
+                rois.append(cell)
+        else:
+            rois.append(cell)
+
+    max_rows = max([roi.shape[0] for roi in rois])
+    max_cols = max([roi.shape[1] for roi in rois])
+
+    rois_new = []
+    for roi in rois:
+        template = np.zeros((max_rows, max_cols))
+        template[: roi.shape[0], : roi.shape[1]] = roi
+        rois_new.append(template)
+
+    rois = np.asarray(rois_new)
+
+    if not well_pos:
+        display_save(rois, save_path, identity, cmap=cmap, step=2)
+    else:
+        display_save(rois, save_path, identity, step=2, cmap=cmap, well_pos=well_pos)
+
+    return rois
+
+
+def display_save(
+    rois: npt.NDArray,
+    path: str,
+    identity: int,
+    cmap="gray",
+    step=2,
+    well_pos: Optional[str] = None,
+):
+    """
+    Function for creating montages
+    ------------------------------
+    INPUTS
+        rois: npt.NDArray, array with shape = (t, x, y) where t is the number of timepoints
+        path: str
+        identity: int
+        cmap: str
+        step: int
+        well_pos: str
+
+    """
+    data_montage = skimage.util.montage(rois[0::step], padding_width=4, fill=np.nan)
+    fig, ax = plt.subplots(figsize=(40, 40))
+    ax.imshow(data_montage, cmap=cmap)
+    title = f"Cell {identity} from {well_pos}" if well_pos else f"Cell {identity}"
+    ax.set_title(title)
+    ax.set_axis_off()
+
+    if path != None:
+        fig.savefig(path, dpi=300)
 
 
 """
@@ -308,7 +506,8 @@ Relevant to morphology based identification unaligned chromosomes (above)
 Relevant to ilastik based identificaiton unaligned chromosomes (below)
 """
 
-def remove_border_objs(img:npt.NDArray):
+
+def remove_border_objs(img: npt.NDArray):
     """
     Removes objects touching the border of a given image
     -------------------------------------------------------
@@ -316,30 +515,31 @@ def remove_border_objs(img:npt.NDArray):
         img: np.ndarray
     OUTPUTS:
         cleared_img: np.ndarray of same shape as img
-    
+
     """
-     
+
     thresh = threshold_otsu(img)
     binary = img > thresh
     labels = label(binary)
     cleared_labels = clear_border(labels)
-    
-    border_objs = np.logical_xor(cleared_labels>0, binary)
+
+    border_objs = np.logical_xor(cleared_labels > 0, binary)
     border_objs = binary_dilation(border_objs, disk(9))
-    
+
     bkg_pixels = img <= thresh
-    bkg = np.median(img[bkg_pixels>0])
-    
+    bkg = np.median(img[bkg_pixels > 0])
+
     cleared_img = np.copy(img)
-    cleared_img[border_objs>0] = bkg
-    
+    cleared_img[border_objs > 0] = bkg
+
     return cleared_img
+
 
 def run_ilastik_arrays(
     image_arrays: List[np.ndarray],
     ilastik_project: str,
     export_source: str = "Simple Segmentation",
-    ilastik_executable: str = "/sw/pkgs/arc/ilastik/1.4.0/run_ilastik.sh"
+    ilastik_executable: str = "/sw/pkgs/arc/ilastik/1.4.0/run_ilastik.sh",
 ) -> List[np.ndarray]:
     """
     Run Ilastik in headless mode on a list of NumPy arrays.
@@ -372,7 +572,7 @@ def run_ilastik_arrays(
             f"--export_source={export_source}",
             f"--output_filename_format={output_template}",
             "--output_format=tiff",
-            "--raw_data"
+            "--raw_data",
         ] + input_paths
 
         subprocess.run(cmd, check=True)
@@ -387,7 +587,7 @@ def run_ilastik_arrays(
             output_arrays.append(tiff.imread(output_file))
 
         return output_arrays
-    
+
 
 def ilastik_unaligned_chromatin(
     identity: int,
@@ -395,23 +595,26 @@ def ilastik_unaligned_chromatin(
     instance: np.ndarray,
     chromatin: np.ndarray,
     ilastic_project_path: str,
-    min_chromatin_area: Optional[int] = 16
+    min_chromatin_area: Optional[int] = 16,
 ) -> tuple[list[int], list[int], list[float], list[int], list[float], list[int], int]:
-
 
     zoom_factor = adjust_zoom_factor(chromatin.shape, instance.shape)
     frames_data = analysis_df.query(f"particle == {identity}")
-    print(f'Working on cell {identity}')
-    
+    print(f"Working on cell {identity}")
+
     cells_fillers = []
     for _, row in frames_data.iterrows():
-        f, l, semantic = int(row["frame"]), int(row["label"]), int(row["semantic_smoothed"])
+        f, l, semantic = (
+            int(row["frame"]),
+            int(row["label"]),
+            int(row["semantic_smoothed"]),
+        )
 
         if semantic == 1:
             mask = instance[f] == l
             if zoom_factor != 1:
                 mask = zoom(mask, zoom_factor, order=0)
-            mask = binary_dilation(mask, square(10))
+            mask = binary_dilation(mask, rectangle(12, 12))
 
             bbox_coords = bbox(mask)
             rmin, rmax, cmin, cmax = bbox_coords
@@ -421,7 +624,7 @@ def ilastik_unaligned_chromatin(
             perfect_psf = np.zeros((19, 19))
             perfect_psf[9, 9] = 1
             psf = gaussian(perfect_psf, 2)
-            cell = richardson_lucy(cell/cell.max(), psf, 20)
+            cell = richardson_lucy(cell / cell.max(), psf, 20)
             cells_fillers.append(cell)
 
         else:
@@ -435,16 +638,17 @@ def ilastik_unaligned_chromatin(
     for obj in cells_fillers:
 
         if isinstance(obj, np.ndarray):
-            print(obj.shape)
             segmentation = segmentations[manual_count]
-            print(segmentation.shape)
 
             unaligned_chromatin = np.copy(segmentation)
             unaligned_chromatin[unaligned_chromatin != 3] = 0
             unaligned_chromatin = unaligned_chromatin > 0
-            unaligned_chromatin = remove_small_holes(unaligned_chromatin, area_threshold=5) #should update based on resolution
-            unaligned_chromatin = remove_small_objects(unaligned_chromatin, min_size = min_chromatin_area)
-            print(unaligned_chromatin.shape)
+            unaligned_chromatin = remove_small_holes(
+                unaligned_chromatin, area_threshold=5
+            )  # should update based on resolution
+            unaligned_chromatin = remove_small_objects(
+                unaligned_chromatin, min_size=min_chromatin_area
+            )
 
             metaphase_plate = np.copy(segmentation)
             metaphase_plate[metaphase_plate != 2] = 0
@@ -452,33 +656,57 @@ def ilastik_unaligned_chromatin(
             metaphase_plate = remove_small_holes(metaphase_plate, area_threshold=15)
 
             area_sig = np.nansum(unaligned_chromatin)
-            intensity_sig = np.nansum(
-                obj[unaligned_chromatin>0]
-            )
+            intensity_sig = np.nansum(obj[unaligned_chromatin > 0])
 
             metaphase_sig = np.nansum(metaphase_plate)
-            metaphase_intensity_sig = np.nansum(
-                obj[metaphase_plate>0]
-            )
-            
-            _, num_sig= label(unaligned_chromatin, return_num=True)
+            metaphase_intensity_sig = np.nansum(obj[metaphase_plate > 0])
+
+            _, num_sig = label(unaligned_chromatin, return_num=True)
+            print(f"Found {num_sig} unaligned chromosomes")
 
             manual_count += 1
 
         else:
-            area_sig, intensity_sig, num_sig, metaphase_sig, metaphase_intensity_sig = 0, 0, 0, 0, 0
+            area_sig, intensity_sig, num_sig, metaphase_sig, metaphase_intensity_sig = (
+                0,
+                0,
+                0,
+                0,
+                0,
+            )
 
-        results.append((area_sig, intensity_sig, num_sig, metaphase_sig, metaphase_intensity_sig))
-        
-    area_sigs, intensity_sigs, num_sigs, metaphase_sigs, metaphase_intensity_sigs = zip(*results)
+        results.append(
+            (area_sig, intensity_sig, num_sig, metaphase_sig, metaphase_intensity_sig)
+        )
 
-
-    return (
-    list(area_sigs),
-    list(intensity_sigs),
-    list(num_sigs),
-    list(metaphase_sigs),
-    list(metaphase_intensity_sigs),
+    area_sigs, intensity_sigs, num_sigs, metaphase_sigs, metaphase_intensity_sigs = zip(
+        *results
     )
 
-    
+    return (
+        list(area_sigs),
+        list(intensity_sigs),
+        list(num_sigs),
+        list(metaphase_sigs),
+        list(metaphase_intensity_sigs),
+    )
+
+
+def bbox(img: npt.NDArray) -> tuple[int]:
+    """
+    Returns the minimum bounding box of a boolean array containing one region of True values
+    ------------------------------------------------------------------------------------------
+    INPUTS:
+        img: npt.NDArray
+    OUTPUTS:
+        rmin: float, lower row index
+        rmax: float, upper row index
+        cmin: float, lower column index
+        cmax: float, upper column index
+    """
+    rows = np.any(img, axis=1)
+    cols = np.any(img, axis=0)
+    rmin, rmax = np.where(rows)[0][[0, -1]]
+    cmin, cmax = np.where(cols)[0][[0, -1]]
+
+    return rmin, rmax, cmin, cmax
