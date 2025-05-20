@@ -375,6 +375,8 @@ if __name__ == "__main__":
         traces = pd.read_excel(cycb_path, sheet_name=0).to_numpy()
         semantic = pd.read_excel(cycb_path, sheet_name=1).to_numpy()
 
+        assert traces.shape == semantic.shape, f"Mismatched shapes: {traces.shape} vs {semantic.shape}"
+
         fit_info = []
         for i, trace in enumerate(traces):
             # cannot be smoothed or trace ends in mitosis
@@ -387,16 +389,14 @@ if __name__ == "__main__":
 
             front_end_chopped = 0
             mit_trace = smooth_trace[semantic[i] == 1]
-            front_end_chopped += np.nonzero(semantic[i])[0][0] + 1
+            front_end_chopped += np.nonzero(semantic[i])[0][0]
 
             # forcing glob_min_index to be greater than glob_max_index
             glob_max_index = np.where(mit_trace == max(mit_trace))[0][0]
-            glob_min_index = np.where(mit_trace == min(mit_trace[glob_max_index:]))[0][
-                0
-            ]
+            glob_min_index = np.where(mit_trace == min(mit_trace[glob_max_index:]))[0][0]
 
             mit_neg_trace = mit_trace[glob_max_index:glob_min_index]
-            front_end_chopped += glob_max_index + 1
+            front_end_chopped += glob_max_index
 
             x = np.linspace(1, mit_neg_trace.shape[0], mit_neg_trace.shape[0])
             if x.shape[0] > 0:
