@@ -8,6 +8,34 @@ import seaborn as sns
 import findiff
 from scipy.signal import find_peaks
 from sklearn.linear_model import LinearRegression
+from typing import Optional
+from collections import namedtuple
+
+
+def model_1_post(data, q):
+
+    alpha_1, beta_1, tau_1 = q
+    x = data.xdata[0]
+    y = data.ydata[0]
+    x = x.reshape((x.shape[0],))
+
+    heaviside_1 = np.heaviside(x - tau_1, 1)
+
+    return alpha_1*x - alpha_1*(x-tau_1)*heaviside_1 + beta_1*(x-tau_1)*heaviside_1 + y[0]
+
+
+def model_2_post(data, q):
+
+    alpha_1, alpha_2, beta_1, beta_2, tau_1, tau_2, tau_3 = q
+    x = data.xdata[0]
+    y = data.ydata[0]
+    x = x.reshape((x.shape[0],))
+
+    heaviside_1 = np.heaviside(x - tau_1, 1)
+    heaviside_2 = np.heaviside(x - tau_2, 1)
+    heaviside_3 = np.heaviside(x- tau_3, 1)
+
+    return y[0] + alpha_1*x + (beta_1-alpha_1)*(x-tau_1)*heaviside_1 + (alpha_2-beta_1)*(x-tau_2)*heaviside_2 + (beta_2-alpha_2)*(x-tau_3)*heaviside_3
 
 
 def smooth_cycb_chromatin(
@@ -218,7 +246,6 @@ def chromatin_vs_rate(cycb:np.ndarray, classi:np.ndarray, chromatin:np.ndarray, 
         regimes = [0, 1, 0, 1]
         rates = [fit_info[0], fit_info[1], fit_info[2], fit_info[3]]
 
-
     else:
         taus.append(fit_info[2])
         taus = np.asarray(taus).astype('int')
@@ -227,11 +254,64 @@ def chromatin_vs_rate(cycb:np.ndarray, classi:np.ndarray, chromatin:np.ndarray, 
         regimes = [0, 1]
         rates = [fit_info[0], fit_info[1]]
 
-    #rates = set(fit_info) - set(taus)
 
     print(len(rates), len(mean_chromatin), len(regimes))
 
     return list( zip(rates, mean_chromatin, regimes) )
+
+
+def two_col_plot_montage(
+        col1_traces:list[np.ndarray], 
+        col2_traces:list[np.ndarray], 
+        classification:list[np.ndarray],
+        fits:Optional[list]=None
+        ):
+
+    try:
+        assert len(col1_traces) == len(col2_traces)
+    except AssertionError:
+        print("Traces for column 1 and column 2 must be of the same length")
+        return 
+    
+    fig, ax = plt.subplots(len(col1_traces), 2, figsize=(10, 2*len(col1_traces)))
+    
+    for i, zipped in enumerate(zip(col1_traces, col2_traces, classification)):
+        col1_trace, col2_trace, classi = zipped
+        
+        col1_trace = savgol_filter(col1_trace, 21, 2)
+
+        low, high = deg_interval(col1_trace, classi)
+        print(high-low)
+        col1_trace = col1_trace[low:high]
+        col2_trace = col2_trace[low:high]
+        x = np.linspace(1, col1_trace.shape[0], col1_trace.shape[0])
+
+        ax[i, 0].plot(x, col1_trace, c = 'k')
+        ax[i, 1].plot(x, col2_trace, c = 'k')
+
+        if fits:
+            fit = fits[i]
+
+            data = namedtuple("data", ["xdata", "ydata"])
+            d = data([x], [col1_trace])
+
+            if np.array_equal(fit, np.zeros(3)):
+                continue
+            else:
+                if fit.shape[0] > 3:
+                    fit = [val if i not in [4, 5, 6] else val-low for i, val in enumerate(fit)]
+                    to_plot = model_2_post(d, fit)
+                else:
+                    fit = [val if i!=2 else val-low for i, val in enumerate(fit)]
+                    to_plot = model_1_post(d, fit)
+                
+                ax[i, 0].plot(x, to_plot, c = 'r')
+        else:
+            pass
+
+    return fig
+
+
 
 
         

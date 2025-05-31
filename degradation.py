@@ -5,7 +5,6 @@ import numpy as np
 import numpy.typing as npt
 import pandas as pd
 import tifffile as tiff
-import matplotlib.pyplot as plt
 import scipy.ndimage as ndi
 from scipy.signal import find_peaks
 
@@ -15,24 +14,15 @@ import skimage
 from skimage.morphology import (
     binary_closing,
 )
-from skimage.filters import threshold_otsu, gaussian
-from skimage.measure import label, regionprops
-from skimage.segmentation import clear_border, watershed
+from skimage.filters import gaussian
+from skimage.measure import label
+from skimage.segmentation import watershed
 from skimage.feature import peak_local_max
 import glob
 import re
-from sklearn.linear_model import LinearRegression
 from segment_chromatin import (
     unaligned_chromatin,
-    bbox,
     ilastik_unaligned_chromatin,
-)  # type:ignore
-from piecewise_fit import (
-    bayes_fit_cycb_regimes,
-    ssfun_1,
-    ssfun_2,
-    model_1,
-    model_2,
 )  # type:ignore
 
 
@@ -186,7 +176,6 @@ def cycb_chromatin_batch_analyze(
     analysis_paths: list,
     instance_paths: list,
     chromatin_paths: list,
-    piecewise_fit: Optional[bool] = False,
 ) -> tuple[pd.DataFrame]:
 
     for name_stub, analysis_path, instance_path, chromatin_path in zip(
@@ -208,45 +197,6 @@ def cycb_chromatin_batch_analyze(
         print(f"Working on position: {name_stub}")
         traces, ids = retrieve_traces(analysis_df, "GFP", 4)
         intensity, semantic, first_tps = qual_deg(traces, 4)
-
-        if piecewise_fit:
-            fit_info = []
-            for i, trace in enumerate(intensity):
-                front_end_chopped = 0
-                mit_trace = trace[semantic[i] == 1]
-                front_end_chopped += np.nonzero(semantic[i])[0][0] + 1
-
-                # forcing glob_min_index to be greater than glob_max_index
-                glob_max_index = np.where(mit_trace == max(mit_trace))[0][0]
-                glob_min_index = np.where(mit_trace == min(mit_trace[glob_max_index:]))[
-                    0
-                ][0]
-
-                mit_neg_trace = mit_trace[glob_max_index:glob_min_index]
-                front_end_chopped += glob_max_index + 1
-
-                x = np.linspace(1, mit_neg_trace.shape[0], mit_neg_trace.shape[0])
-                if x.shape[0] > 0:
-                    params = bayes_fit_cycb_regimes(
-                        x, mit_neg_trace, [ssfun_1, ssfun_2], [model_1, model_2]
-                    )
-                else:
-                    params = None
-
-                if params == None:
-                    pass
-                elif len(params) == 3:
-                    params[2] += front_end_chopped
-                elif len(params) == 7:
-                    params = [
-                        param if i < 4 else param + front_end_chopped
-                        for i, param in enumerate(params)
-                    ]
-
-                fit_info.append(params)
-
-        else:
-            pass
 
         un_chromatin = []
         un_intensity = []
@@ -324,7 +274,6 @@ def cycb_chromatin_batch_analyze_ilastik(
     instance_paths: list,
     chromatin_paths: list,
     ilastik_project_path: str,
-    piecewise_fit: Optional[bool] = False,
 ) -> tuple[pd.DataFrame]:
 
     for name_stub, analysis_path, instance_path, chromatin_path in zip(
@@ -346,45 +295,6 @@ def cycb_chromatin_batch_analyze_ilastik(
         print(f"Working on position: {name_stub}")
         traces, ids = retrieve_traces(analysis_df, "GFP", 4)
         intensity, semantic, first_tps = qual_deg(traces, 4)
-
-        if piecewise_fit:
-            fit_info = []
-            for i, trace in enumerate(intensity):
-                front_end_chopped = 0
-                mit_trace = trace[semantic[i] == 1]
-                front_end_chopped += np.nonzero(semantic[i])[0][0] + 1
-
-                # forcing glob_min_index to be greater than glob_max_index
-                glob_max_index = np.where(mit_trace == max(mit_trace))[0][0]
-                glob_min_index = np.where(mit_trace == min(mit_trace[glob_max_index:]))[
-                    0
-                ][0]
-
-                mit_neg_trace = mit_trace[glob_max_index:glob_min_index]
-                front_end_chopped += glob_max_index + 1
-
-                x = np.linspace(1, mit_neg_trace.shape[0], mit_neg_trace.shape[0])
-                if x.shape[0] > 0:
-                    params = bayes_fit_cycb_regimes(
-                        x, mit_neg_trace, [ssfun_1, ssfun_2], [model_1, model_2]
-                    )
-                else:
-                    params = None
-
-                if params == None:
-                    pass
-                elif len(params) == 3:
-                    params[2] += front_end_chopped
-                elif len(params) == 7:
-                    params = [
-                        param if i < 4 else param + front_end_chopped
-                        for i, param in enumerate(params)
-                    ]
-
-                fit_info.append(params)
-
-        else:
-            pass
 
         un_chromatin = []
         un_intensity = []
