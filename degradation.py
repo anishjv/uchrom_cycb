@@ -8,8 +8,7 @@ import tifffile as tiff
 import scipy.ndimage as ndi
 from scipy.signal import find_peaks
 
-from typing import Tuple, List, Optional
-
+from typing import Optional
 import skimage
 from skimage.morphology import (
     binary_closing,
@@ -21,8 +20,7 @@ from skimage.feature import peak_local_max
 import glob
 import re
 from segment_chromatin import (
-    unaligned_chromatin,
-    ilastik_unaligned_chromatin,
+    unaligned_chromatin, ChromatinSegConfig
 )  # type:ignore
 
 
@@ -30,82 +28,63 @@ def retrieve_traces(
     analysis_df: pd.DataFrame,
     wl: str,
     frame_interval: int,
-    clean: Optional[bool] = True,
-) -> list[npt.NDArray]:
+    remove_end_mitosis: Optional[bool] = False,
+) -> tuple[list[npt.NDArray], list[npt.NDArray], list, list, list[npt.NDArray]]:
     """
-    Retrieves traces for a given wavelength from the "analysis.xlsx" cellapp-analysis output spreadsheet
+    Retrieve corrected intensity and semantic traces for a channel, enforcing selection rules and experiment length constraints.
     ------------------------------------------------------------------------------------------------------
     INPUTS:
-        analysis_df: pd.DataFrame, analysis.xlsx output from https://github.com/ajitpj/cellapp-analysis
-        wl: str
-        clean_spurious: bool
+    	analysis_df: pd.DataFrame, analysis.xlsx output from `https://github.com/ajitpj/cellapp-analysis`
+    	wl: str, channel name to process
+    	frame_interval: int, time between successive frames; sets t_char = 20 // frame_interval
+    	exp_length: int, total number of frames in the experiment; used for end-of-trace filtering
+    	remove_end_mitosis: bool, if True exclude traces that end mitotic at frame exp_length-1; otherwise allow a single end-plateau
     OUTPUTS:
-        traces: list[npt.NDArray]
+    	intensity_traces: list[npt.NDArray], corrected intensities (intensity - bkg) * intensity_corr
+    	semantic_traces: list[npt.NDArray], unpadded semantic traces
+    	ids: list, particle identifiers retained
+    	first_tps: list, indices of first mitotic call (left base of the detected peak)
+    	frame_traces: list[npt.NDArray], actual frame numbers for each trace
     """
 
-    traces = []
     ids = []
-    for id in analysis_df["particle"].unique():
-        trace = analysis_df.query(f"particle=={id}")[[f"{wl}", "semantic_smoothed"]]
-        bkg = analysis_df.query(f"particle=={id}")[f"{wl}_bkg_corr"]
-        intensity = analysis_df.query(f"particle=={id}")[f"{wl}_int_corr"]
-
-        trace = trace.to_numpy()
-
-        if clean:
-            t_char = 30 // frame_interval
-            padded_semantic = np.append(trace[:, 1], np.zeros(3))
-            _, props = find_peaks(padded_semantic, plateau_size=1)
-            peak_widths = [
-                width
-                for i, width in enumerate(props["plateau_sizes"])
-                if width >= t_char
-            ]
-            if (
-                len(peak_widths) == 1
-                and (np.sum(props["plateau_sizes"]) - peak_widths[0]) < t_char
-            ):
-                if padded_semantic[0] != 1:
-                    trace[:, 0] = (trace[:, 0] - bkg) * intensity
-                    traces.append(trace)
-                    ids.append(id)
-        else:
-            traces.append(trace)
-            ids.append(id)
-
-    return traces, ids
-
-
-def qual_deg(traces: npt.NDArray, frame_interval: int) -> tuple[npt.NDArray]:
-    """
-    Returns the signal from some arbitrary fluorophore begining after a cell-aap mitosis call
-    ------------------------------------------------------------------------------------------
-    INPUTS:
-        traces: npt.NDarray, output of retrieve_traces()
-        frame_interval: int, time between successive frames
-    OUTPUTS:
-        intensity_container: npt.NDArray
-        semantic_container: npt.NDArray
-    """
-
     intensity_traces = []
     semantic_traces = []
-    first_tp = []
-    t_char = 30 // frame_interval
-    for trace in traces:
-        padded_semantic = np.append(trace[:, 1], np.zeros(3))
-        peaks, props = find_peaks(padded_semantic, plateau_size=t_char)
-        if props["plateau_sizes"][0] % 2:
-            first_mitosis = peaks[0] - (props["plateau_sizes"][0] // 2)
-        else:
-            first_mitosis = peaks[0] - (props["plateau_sizes"][0] // 2 - 1)
-        intensity_trace = trace[:, 0]
-        semantic_trace = trace[:, 1]
-        intensity_traces.append(intensity_trace)
-        semantic_traces.append(semantic_trace)
-        first_tp.append(first_mitosis)
+    first_tps = []
+    frame_traces = []
+    t_char = 20 // frame_interval
 
-    return intensity_traces, semantic_traces, first_tp
+    for id in analysis_df["particle"].unique():
+        intensity = analysis_df.query(f"particle=={id}")[f"{wl}"].to_numpy()
+        semantic = analysis_df.query(f"particle=={id}")["semantic_smoothed"].to_numpy()
+        bkg = analysis_df.query(f"particle=={id}")[f"{wl}_bkg_corr"].to_numpy()
+        intensity_corr = analysis_df.query(f"particle=={id}")[f"{wl}_int_corr"].to_numpy()
+        frames = analysis_df.query(f"particle=={id}")["frame"].to_numpy()
+
+        # Always remove traces that start in mitosis
+        if semantic[0] == 1:
+            continue
+        # 1) If remove_end_mitosis is True and the trace ends in mitosis at the final frame, skip
+        if remove_end_mitosis and semantic[-1] == 1:
+            continue
+
+        # Peak detection array: pad to allow end-plateau to be counted as a peak
+        semantic_for_detection = ( np.append(semantic, np.zeros(3)))
+
+        # Detect mitosis events; require exactly one event to satisfy
+        _, props = find_peaks(semantic_for_detection, width=t_char)
+        if props["widths"].size != 1:
+            continue
+
+        first_mitosis = props["left_bases"][0]
+        corr_intensity = (intensity - bkg) * intensity_corr
+        intensity_traces.append(corr_intensity)
+        semantic_traces.append(semantic)
+        frame_traces.append(frames)
+        first_tps.append(first_mitosis)
+        ids.append(id)
+
+    return intensity_traces, semantic_traces, ids, first_tps, frame_traces
 
 
 def watershed_split(
@@ -115,10 +94,10 @@ def watershed_split(
     Splits and labels touching objects using the watershed algorithm
     ------------------------------------------------------------------
     INPUTS:
-        binary_img: image where 1s correspond to object regions and 0s correspond to background
-        sigma: standard deviation to use for gaussian kernal smoothing
+    	binary_img: image where 1s correspond to object regions and 0s correspond to background
+    	sigma: standard deviation to use for gaussian kernal smoothing
     OUTPUTS:
-        labels: image of same size as binary_img but labeled
+    	labels: image of same size as binary_img but labeled
     """
 
     # distance transform
@@ -140,8 +119,20 @@ def watershed_split(
 
 
 def longest_negative_sequence(arr):
-    arr = np.asarray(arr)
+    """
+    Finds the longest contiguous run of negative values in a 1D array.
+    ------------------------------------------------------------------------------------------------------
+    INPUTS:
+        arr: array-like, sequence of numeric values (will be converted to a NumPy array)
+    OUTPUTS:
+        If a negative run exists:
+            start_idx: int, start index (inclusive) of the longest negative run
+            end_idx: int, end index (inclusive) of the longest negative run
+        If no negative run exists:
+            0, None, None
+    """
 
+    arr = np.asarray(arr)
     # Boolean array: True where arr < 0
     is_negative = arr < 0
 
@@ -176,7 +167,25 @@ def cycb_chromatin_batch_analyze(
     analysis_paths: list,
     instance_paths: list,
     chromatin_paths: list,
+    frame_interval_minutes: float = 4.0,
+    config: Optional[object] = None,
 ) -> tuple[pd.DataFrame]:
+    """
+    Batch analyze chromatin segmentation for multiple positions.
+    --------------------------------------------------------------------
+    INPUTS:
+    	positions: list, position identifiers
+    	analysis_paths: list, paths to analysis Excel files
+    	instance_paths: list, paths to instance movie files
+    	chromatin_paths: list, paths to chromatin movie files
+    	frame_interval_minutes: float, time between frames in minutes
+    	config: Optional[ChromatinSegConfig], configuration parameters
+    OUTPUTS:
+    	None (saves Excel files to disk)
+    """
+    
+    if config is None:
+        config = ChromatinSegConfig()
 
     for name_stub, analysis_path, instance_path, chromatin_path in zip(
         positions, analysis_paths, instance_paths, chromatin_paths
@@ -195,163 +204,117 @@ def cycb_chromatin_batch_analyze(
         analysis_df.dropna(inplace=True)
 
         print(f"Working on position: {name_stub}")
-        traces, ids = retrieve_traces(analysis_df, "GFP", 4)
-        intensity, semantic, first_tps = qual_deg(traces, 4)
+        intensity, semantic, ids, first_tps, frame_traces = retrieve_traces(
+            analysis_df, "GFP", int(frame_interval_minutes)
+        )
 
-        un_chromatin = []
-        un_intensity = []
-        tot_intensity = []
-        un_number = []
-        tot_avg_intensity = []
-        tot_area = []
-        first_anaphase = []
-        traced_rois = []
-        unaligned_chromosomes = [
-            unaligned_chromatin(identity, analysis_df, instance, chromatin)
-            for i, identity in enumerate(ids)
-        ]
-        for i, data_tuple in enumerate(unaligned_chromosomes):
-            un_chromatin.append(data_tuple[0])
-            un_intensity.append(data_tuple[1])
-            tot_intensity.append(data_tuple[2])
-            un_number.append(data_tuple[3])
-            tot_avg_intensity.append(data_tuple[4])
-            tot_area.append(data_tuple[5])
-            first_anaphase.append(data_tuple[6])
-            '''
-            if len(data_tuple[7]) > 0:
-                traced_rois.append(np.asarray(data_tuple[7], dtype="object"))
-            '''
+        # Initialize dataframe with empty lists for each column
+        degradation_data = pd.DataFrame({
+            'cell_id': [],
+            'frame': [],
+            'cycb_intensity': [],
+            'semantic': [],
+            'u_chromatin_area': [],
+            'u_chromatin_intensity': [],
+            't_chromatin_intensity': [],
+            'num_u_chromosomes': [],
+            't_chromatin_area': []
+        })
+        
+        # Store cell-level summary data
+        cell_summary_data = []
+        
+        # Process each cell and extend the dataframe directly
+        for i, cell_id in enumerate(ids):
+            # Get chromatin segmentation data for this cell
+            data_tuple = unaligned_chromatin(
+                cell_id, analysis_df, instance, chromatin,
+                frame_interval_minutes=frame_interval_minutes,
+                config=config
+            )
 
-        cycb = pd.DataFrame(intensity)
-        classification = pd.DataFrame(semantic)
-        un_chromatin_area = pd.DataFrame(un_chromatin)
-        un_chromatin_intensity = pd.DataFrame(un_intensity)
-        un_chromatin_number = pd.DataFrame(un_number)
-        total_intensity = pd.DataFrame(tot_intensity)
-        total_avg_intensity = pd.DataFrame(tot_avg_intensity)
-        total_area = pd.DataFrame(tot_area)
+            if data_tuple is None:
+                continue
+            
+            # Get the actual frames for this cell
+            frames = frame_traces[i]
+            
+            # Create data for this cell
+            cell_data = {
+                'cell_id': [cell_id] * len(frames),
+                'frame': frames,
+                'cycb_intensity': intensity[i],
+                'semantic': semantic[i],
+                'u_chromatin_area': data_tuple[0],
+                'u_chromatin_intensity': data_tuple[1],
+                't_chromatin_intensity': data_tuple[2],
+                'num_u_chromosomes': data_tuple[3],
+                't_chromatin_area': data_tuple[4]
+            }
+            
+            # Extend the dataframe with this cell's data
+            degradation_data = pd.concat([degradation_data, pd.DataFrame(cell_data)], ignore_index=True)
+            
+            # Store cell-level summary data
+            cell_summary_data.append({
+                'cell_id': cell_id,
+                'first_mitosis': first_tps[i],
+                'first_anaphase': data_tuple[5],
+                'n_frames': len(frames),
+                'frame_start': frames[0],
+                'frame_end': frames[-1]
+            })
+        
+        print(f"Created long-format dataframe with {len(degradation_data)} rows")
+        print(f"Data format: {len(ids)} cells × {degradation_data['frame'].nunique()} unique frames")
+        print(f"Frame range: {degradation_data['frame'].min()} to {degradation_data['frame'].max()}")
+        print(f"Excel file contains: degradation_data, cell_summary, and analysis_config sheets")
 
-        d_temp = {
-            "ids": ids,
-            "first_mitosis": first_tps,
-            "first_anaphase": first_anaphase,
-            "raw_data_paths": [instance_path, analysis_path, chromatin_path],
-        }
-        other_data = pd.DataFrame(dict([(k, pd.Series(v)) for k, v in d_temp.items()]))
+        # Create cell summary dataframe
+        cell_summary_df = pd.DataFrame(cell_summary_data)
+        
+        # Create analysis info dataframe
+        analysis_info = pd.DataFrame({
+            "instance_path": [instance_path],
+            "analysis_path": [analysis_path],
+            "chromatin_path": [chromatin_path],
+            "frame_interval_minutes": [frame_interval_minutes],
+            "n_cells": [len(ids)],
+            "total_frames": [len(degradation_data)]
+        })
+        
+        # Create config info dataframe separately
+        if hasattr(config, '__dict__'):
+            config_info = pd.DataFrame([config.__dict__])
+        else:
+            config_info = pd.DataFrame()
+        
+        # Combine the dataframes
+        if not config_info.empty:
+            analysis_config_df = pd.concat([analysis_info, config_info], axis=1)
+        else:
+            analysis_config_df = analysis_info
 
         save_dir = os.path.dirname(analysis_path)
         if not os.path.isdir(save_dir):
             save_dir = os.getcwd()
         save_path = os.path.join(save_dir, f"{name_stub}_cycb_chromatin.xlsx")
 
-        if len(traced_rois) > 0:
-            arr_save_path = os.path.join(save_dir, f"{name_stub}_rois.npy")
-            traced_rois = np.asarray(traced_rois, dtype="object")
-            np.save(arr_save_path, traced_rois)
-
         with pd.ExcelWriter(save_path, engine="openpyxl") as writer:
-            cycb.to_excel(writer, sheet_name="cycb")
-            classification.to_excel(writer, sheet_name="classification")
-            un_chromatin_area.to_excel(writer, sheet_name="unaligned chromatin area")
-            un_chromatin_intensity.to_excel(
-                writer, sheet_name="unaligned chromatin intensity"
-            )
-            total_intensity.to_excel(writer, sheet_name="total chromatin intensity")
-            un_chromatin_number.to_excel(
-                writer, sheet_name="number of unaligned chromosomes (approx.)"
-            )
-            total_avg_intensity.to_excel(
-                writer, sheet_name="average chromatin intensity"
-            )
-            total_avg_intensity.to_excel(writer, sheet_name="total chromatin area")
-            other_data.to_excel(writer, sheet_name="analysis_info")
-
-
-def cycb_chromatin_batch_analyze_ilastik(
-    positions: list,
-    analysis_paths: list,
-    instance_paths: list,
-    chromatin_paths: list,
-    ilastik_project_path: str,
-) -> tuple[pd.DataFrame]:
-
-    for name_stub, analysis_path, instance_path, chromatin_path in zip(
-        positions, analysis_paths, instance_paths, chromatin_paths
-    ):
-        try:
-            instance = tiff.imread(instance_path)
-            chromatin = tiff.imread(chromatin_path)
-            analysis_df = pd.read_excel(analysis_path)
-        except FileNotFoundError:
-            print(
-                f"Could not find either the instance movie, chromatin movie, or analysis dataframe for {analysis_path}"
-            )
-            continue
-
-        analysis_df.replace([np.inf, -np.inf], np.nan, inplace=True)
-        analysis_df.dropna(inplace=True)
-
-        print(f"Working on position: {name_stub}")
-        traces, ids = retrieve_traces(analysis_df, "GFP", 4)
-        intensity, semantic, first_tps = qual_deg(traces, 4)
-
-        un_chromatin = []
-        un_intensity = []
-        un_number = []
-        metphs = []
-        metphs_intensity = []
-        unaligned_chromosomes = [
-            ilastik_unaligned_chromatin(
-                identity, analysis_df, instance, chromatin, ilastik_project_path
-            )
-            for i, identity in enumerate(ids)
-        ]
-        for i, data_tuple in enumerate(unaligned_chromosomes):
-            un_chromatin.append(data_tuple[0])
-            un_intensity.append(data_tuple[1])
-            un_number.append(data_tuple[2])
-            metphs.append(data_tuple[3])
-            metphs_intensity.append(data_tuple[4])
-
-        cycb = pd.DataFrame(intensity)
-        classification = pd.DataFrame(semantic)
-        un_chromatin_area = pd.DataFrame(un_chromatin)
-        un_chromatin_intensity = pd.DataFrame(un_intensity)
-        un_chromatin_number = pd.DataFrame(un_number)
-        metphs_area = pd.DataFrame(metphs)
-        metphs_intensity = pd.DataFrame(metphs_intensity)
-
-        d_temp = {
-            "ids": ids,
-            "first_mitosis": first_tps,
-            "raw_data_paths": [instance_path, analysis_path, chromatin_path],
-        }
-        other_data = pd.DataFrame(dict([(k, pd.Series(v)) for k, v in d_temp.items()]))
-
-        save_dir = os.path.dirname(analysis_path)
-        if not os.path.isdir(save_dir):
-            save_dir = os.getcwd()
-        save_path = os.path.join(save_dir, f"{name_stub}_cycb_chromatin_ilastic.xlsx")
-
-        with pd.ExcelWriter(save_path, engine="openpyxl") as writer:
-            cycb.to_excel(writer, sheet_name="cycb")
-            classification.to_excel(writer, sheet_name="classification")
-            un_chromatin_area.to_excel(writer, sheet_name="unaligned chromatin area")
-            un_chromatin_intensity.to_excel(
-                writer, sheet_name="unaligned chromatin intensity"
-            )
-            metphs_area.to_excel(writer, sheet_name="metaphase plate area")
-            un_chromatin_number.to_excel(
-                writer, sheet_name="number unaligned chromosomes"
-            )
-            metphs_intensity.to_excel(writer, sheet_name="metaphase plate inten.")
-            other_data.to_excel(writer, sheet_name="analysis_info")
+            # Save main data in long format (similar to cellaap_analysis.py)
+            # Each row represents a (cell_id, frame) combination with all attributes as columns
+            degradation_data.to_excel(writer, sheet_name="degradation_data", index=False)
+            
+            # Save cell-level summary data
+            cell_summary_df.to_excel(writer, sheet_name="cell_summary", index=False)
+            
+            # Save combined analysis and config metadata
+            analysis_config_df.to_excel(writer, sheet_name="analysis_config", index=False)
 
 
 if __name__ == "__main__":
 
-    root_dir = Path("input/root/dir")
+    root_dir = Path("/Users/whoisv/Desktop/")
     inference_dirs = [
         obj.path
         for obj in os.scandir(root_dir)
@@ -384,7 +347,23 @@ if __name__ == "__main__":
         print("Analysis paths", len(analysis_paths))
         print("Instance paths", len(instance_paths))
         print("Chromatin paths", len(chromatin_paths))
-
+    
+    # Use default configuration
     cycb_chromatin_batch_analyze(
-        positions, analysis_paths, instance_paths, chromatin_paths
+        positions, analysis_paths, instance_paths, chromatin_paths,
+        frame_interval_minutes=4.0
     )
+    
+    '''
+    Example with custom configuration for different experimental conditions
+    from segment_chromatin import ChromatinSegConfig
+    config = ChromatinSegConfig(
+        min_chromatin_area=8,  # Higher threshold for cleaner data
+        intensity_diff_ratio_threshold=0.3,  # More sensitive anaphase detection
+        frame_interval_minutes=2.0  # Different acquisition rate
+    )
+    cycb_chromatin_batch_analyze(
+        positions, analysis_paths, instance_paths, chromatin_paths,
+        frame_interval_minutes=2.0, config=config
+    )
+    '''

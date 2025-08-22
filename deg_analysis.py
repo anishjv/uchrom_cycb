@@ -1,48 +1,60 @@
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
-from scipy.signal import savgol_filter
-import itertools
-from scipy import stats
-import seaborn as sns
-import findiff
-from scipy.signal import find_peaks
-from sklearn.linear_model import LinearRegression
 from typing import Optional
 from collections import namedtuple
+from skimage.restoration import denoise_tv_chambolle
 
 
 def model_1_post(data, q):
-
-    alpha_1, beta_1, tau_1 = q
-    x = data.xdata[0]
-    y = data.ydata[0]
-    x = x.reshape((x.shape[0],))
-
-    heaviside_1 = np.heaviside(x - tau_1, 1)
-
-    return alpha_1*x - alpha_1*(x-tau_1)*heaviside_1 + beta_1*(x-tau_1)*heaviside_1 + y[0]
-
-
-def model_2_post(data, q):
-
-    alpha_1, alpha_2, beta_1, beta_2, tau_1, tau_2, tau_3 = q
+    """
+    Post-processing model_1 with final flat segment.
+    q = [alpha_1, beta_1, gamma_1, tau_1, tau_2]
+    """
+    alpha_1, beta_1, gamma_1, tau_1, tau_2 = q
     x = data.xdata[0]
     y = data.ydata[0]
     x = x.reshape((x.shape[0],))
 
     heaviside_1 = np.heaviside(x - tau_1, 1)
     heaviside_2 = np.heaviside(x - tau_2, 1)
-    heaviside_3 = np.heaviside(x- tau_3, 1)
 
-    return y[0] + alpha_1*x + (beta_1-alpha_1)*(x-tau_1)*heaviside_1 + (alpha_2-beta_1)*(x-tau_2)*heaviside_2 + (beta_2-alpha_2)*(x-tau_3)*heaviside_3
+    return (
+        y[0]
+        + alpha_1 * x
+        + (beta_1 - alpha_1) * (x - tau_1) * heaviside_1
+        + (gamma_1 - beta_1) * (x - tau_2) * heaviside_2
+    )
+
+
+def model_2_post(data, q):
+    """
+    Post-processing model_2 with final flat segment.
+    q = [alpha_1, alpha_2, beta_1, beta_2, gamma_2, tau_1, tau_2, tau_3, tau_4]
+    """
+    alpha_1, alpha_2, beta_1, beta_2, gamma_2, tau_1, tau_2, tau_3, tau_4 = q
+    x = data.xdata[0]
+    y = data.ydata[0]
+    x = x.reshape((x.shape[0],))
+
+    heaviside_1 = np.heaviside(x - tau_1, 1)
+    heaviside_2 = np.heaviside(x - tau_2, 1)
+    heaviside_3 = np.heaviside(x - tau_3, 1)
+    heaviside_4 = np.heaviside(x - tau_4, 1)
+
+    return (
+        y[0]
+        + alpha_1 * x
+        + (beta_1 - alpha_1) * (x - tau_1) * heaviside_1
+        + (alpha_2 - beta_1) * (x - tau_2) * heaviside_2
+        + (beta_2 - alpha_2) * (x - tau_3) * heaviside_3
+        + (gamma_2 - beta_2) * (x - tau_4) * heaviside_4
+    )
 
 
 def smooth_cycb_chromatin(
     cycb: pd.DataFrame,
     chromatin: pd.DataFrame,
-    width: int,
-    deriv_order: int,
 ):
     """
     Smooths and signal, chromatin traces; computes derivative of signal
@@ -52,12 +64,12 @@ def smooth_cycb_chromatin(
         width: width of savitsky golay filter
         deriv_order: derivative to compute
     OUPUTS:
-        smooth_cycb: list containing smoothed cylinb traces
+        cycb: list containing  cyclinb traces
         dcycb_dt: list containing computed derivative traces
         chromatin: list containing smoothed chromatin traces
     """
 
-    smooth_cycb = []
+    traces = []
     dcycb_dt = []
     smooth_chromatin = []
     for i in range(cycb.shape[0]):
@@ -66,22 +78,15 @@ def smooth_cycb_chromatin(
         chromatin_trace = chromatin.iloc[i].to_numpy()
         chromatin_trace[np.isnan(chromatin_trace)] = 0
 
-        if trace.shape[0] > width:
-            smooth_trace = savgol_filter(trace, width, 2)
-            first_deriv = savgol_filter(trace, width, 2, deriv=deriv_order)
-            smooth_chroma = savgol_filter(chromatin_trace, width, 2)
-            smooth_chroma[smooth_chroma < 0] = (
-                0  # artifact of savistky golay operating on non-continous array
-            )
-            smooth_cycb.append(smooth_trace)
-            dcycb_dt.append(first_deriv)
-            smooth_chromatin.append(smooth_chroma)
-        else:
-            smooth_cycb.append(None)
-            dcycb_dt.append(None)
-            smooth_chromatin.append(None)
+        smooth_trace = denoise_tv_chambolle(trace, weight=12)
+        first_deriv = np.gradient(smooth_trace)
+        smooth_chroma = denoise_tv_chambolle(chromatin_trace, weight=12)
 
-    return smooth_cycb, dcycb_dt, smooth_chromatin
+        dcycb_dt.append(first_deriv)
+        smooth_chromatin.append(smooth_chroma)
+        traces.append(trace)
+
+    return traces, dcycb_dt, smooth_chromatin
 
 
 def retrive(positions: list[tuple], path_templ: str):
@@ -105,10 +110,10 @@ def retrive(positions: list[tuple], path_templ: str):
         fitting = pd.read_excel(path, sheet_name="fitting info", index_col=0)
 
         smooth_cycb, dcycb_dt, chromatin_area = smooth_cycb_chromatin(
-            cycb, un_chromatin_area, 21, 1
+            cycb, un_chromatin_area
         )
         for i, trace in enumerate(smooth_cycb):
-            traces.append(trace)
+            traces.append(cycb.iloc[i])
             classification.append(np.asarray(classi.iloc[i]))
             dcycb.append(dcycb_dt[i])
             chromatin.append(chromatin_area[i])
@@ -119,7 +124,7 @@ def retrive(positions: list[tuple], path_templ: str):
 
 
 def unpack_cycb_chromatin(
-    smooth_cycb: list,
+    cycb: list,
     dcycb_dt: list,
     classi: list,
     chromatin_area: list,
@@ -128,7 +133,7 @@ def unpack_cycb_chromatin(
     """
     Unpacks data to compare individual data points
     INPUTS:
-        smooth_cycb: traces output of retrieve()
+        cycb: traces output of retrieve()
         dcycb_dt: dcycb output of retrieve()
         classi: classification output of retrieve()
         chromatin_area: chromatin output of retrieve()
@@ -145,7 +150,7 @@ def unpack_cycb_chromatin(
     unpacked_chromatin_area = []
     unpacked_regime = []
 
-    for j, cell_trace in enumerate(smooth_cycb):
+    for j, cell_trace in enumerate(cycb):
 
         if classi[j][-1] == 1:
             continue
@@ -163,20 +168,24 @@ def unpack_cycb_chromatin(
                 if fit_info:
                     fit = fit_info[j]
 
-                    if fit.shape[0] > 3:
-                        if k < fit[4] - 2:
+                    if fit.shape[0] > 5:
+                        if k < fit[5]:
                             regime = 0
-                        elif fit[4] - 2 <= k and k < fit[5] - 2:
+                        elif fit[5]  <= k and k < fit[6]:
                             regime = 1
-                        elif fit[5] - 2 <= k and k < fit[6] - 2:
+                        elif fit[6] <= k and k < fit[7]:
                             regime = 0
+                        elif fit[7] <= k and k < fit[8]:
+                            regime = 1
                         else:
-                            regime = 1
+                            regime = -1
                     else:
-                        if k < fit[2] - 2:
+                        if k < fit[3]:
                             regime = 0
-                        else:
+                        elif fit[3] <= k and k < fit[4]:
                             regime = 1
+                        else:
+                            regime = -1
 
                     unpacked_regime.append(regime)
                 else:
@@ -236,28 +245,30 @@ def chromatin_vs_rate(cycb:np.ndarray, classi:np.ndarray, chromatin:np.ndarray, 
 
     low_bound, high_bound = deg_interval(cycb, classi)
 
-    if fit_info.shape[0] > 3:
-        taus += [fit_info[4], fit_info[5], fit_info[6]]
+    if fit_info.shape[0] > 5:
+        taus += [fit_info[5], fit_info[6], fit_info[7], fit_info[8]]
         taus = np.asarray(taus).astype('int')
         mean_chromatin.append( chromatin[low_bound:taus[0]].mean() )
         mean_chromatin.append( chromatin[taus[0]:taus[1]].mean() )
         mean_chromatin.append( chromatin[taus[1]:taus[2]].mean() )
-        mean_chromatin.append( chromatin[taus[2]:high_bound].mean() )
+        mean_chromatin.append( chromatin[taus[2]:taus[3]].mean() )
         regimes = [0, 1, 0, 1]
-        rates = [fit_info[0], fit_info[1], fit_info[2], fit_info[3]]
+        rates = [fit_info[0], fit_info[2], fit_info[1], fit_info[3]] 
+        durations = [ taus[0]-low_bound, taus[1]-taus[0], taus[2]-taus[1], taus[3]-taus[2] ]  #alpha_1, #beta_1, #alpha_2, #beta_2
+        cycb_ranges = [ cycb[low_bound]-cycb[high_bound], cycb[taus[0]] - cycb[high_bound], cycb[taus[1]] - cycb[high_bound], cycb[taus[2]] - cycb[high_bound]]
 
     else:
-        taus.append(fit_info[2])
+        taus += [fit_info[3], fit_info[4]]
         taus = np.asarray(taus).astype('int')
         mean_chromatin.append( chromatin[low_bound:taus[0]].mean() )
-        mean_chromatin.append( chromatin[taus[0]:high_bound].mean() )
+        mean_chromatin.append( chromatin[taus[0]:taus[1]].mean() )
         regimes = [0, 1]
         rates = [fit_info[0], fit_info[1]]
+        durations = [ taus[0]-low_bound, taus[1]-taus[0] ]
+        cycb_ranges = [ cycb[low_bound]-cycb[high_bound], cycb[taus[0]] - cycb[high_bound] ]
 
 
-    print(len(rates), len(mean_chromatin), len(regimes))
-
-    return list( zip(rates, mean_chromatin, regimes) )
+    return list( zip(rates, mean_chromatin, regimes, durations, cycb_ranges) )
 
 
 def two_col_plot_montage(
@@ -273,15 +284,14 @@ def two_col_plot_montage(
         print("Traces for column 1 and column 2 must be of the same length")
         return 
     
-    fig, ax = plt.subplots(len(col1_traces), 2, figsize=(10, 2*len(col1_traces)))
+    fig, ax = plt.subplots(len(col1_traces), 2, figsize=(10, 2*len(col1_traces)), sharey='col')
     
     for i, zipped in enumerate(zip(col1_traces, col2_traces, classification)):
         col1_trace, col2_trace, classi = zipped
         
-        col1_trace = savgol_filter(col1_trace, 21, 2)
-
+        col1_trace = np.asarray(col1_trace)
         low, high = deg_interval(col1_trace, classi)
-        print(high-low)
+
         col1_trace = col1_trace[low:high]
         col2_trace = col2_trace[low:high]
         x = np.linspace(1, col1_trace.shape[0], col1_trace.shape[0])
@@ -298,11 +308,13 @@ def two_col_plot_montage(
             if np.array_equal(fit, np.zeros(3)):
                 continue
             else:
-                if fit.shape[0] > 3:
-                    fit = [val if i not in [4, 5, 6] else val-low for i, val in enumerate(fit)]
+                if fit.shape[0] > 5:
+                    fit = [val if i not in [5, 6, 7, 8] else val-low for i, val in enumerate(fit)]
+                    print(fit)
                     to_plot = model_2_post(d, fit)
                 else:
-                    fit = [val if i!=2 else val-low for i, val in enumerate(fit)]
+                    fit = [val if i not in [3, 4] else val-low for i, val in enumerate(fit)]
+                    print(fit)
                     to_plot = model_1_post(d, fit)
                 
                 ax[i, 0].plot(x, to_plot, c = 'r')

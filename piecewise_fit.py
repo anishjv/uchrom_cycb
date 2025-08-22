@@ -10,6 +10,7 @@ from scipy.signal import savgol_filter
 from zipfile import BadZipFile
 from deg_analysis import deg_interval
 from typing import Optional
+import glob
 
 
 def fit_three_lines(
@@ -139,178 +140,150 @@ def sigmoid(x, weight:Optional[float]=1):
 
 def model_1(data, q):
     """
-    Heaviside function model with one slope switchpoint.
+     Heaviside function model with one slope switchpoint.
     Designed to interface with the package pymcmcstat
     """
 
-    alpha_1, delta_beta_1, theta_1 = q
+    alpha_1, delta_beta_1, gamma_1, theta_1, theta_2 = q
     x = data.xdata[0]
     y = data.ydata[0]
     x = x.reshape((x.shape[0],))
-    tau_min = 2
-    tau_max = x.shape[0]-2
+    tau_min = min( x.shape[0]//10, 2 )
+    tau_max = x.shape[0]
+    delta = min( x.shape[0]//10, 2 )
 
     # ensures beta_1 < alpha_1
     beta_1 = alpha_1 - delta_beta_1
-
-    tau_1 = tau_min + (tau_max-tau_min) *sigmoid(theta_1)
+    tau_1 = tau_min + (tau_max - tau_min - delta) *sigmoid(theta_1)
+    tau_2 = (tau_1 + delta) + (tau_max - tau_1 - delta) *sigmoid(theta_2)
 
     x_idx = np.arange(x.shape[0])
     heaviside_1 = np.heaviside(x_idx - tau_1, 1)
+    heaviside_2 = np.heaviside(x_idx - tau_2, 1)
 
     return (
         alpha_1 * x
         - alpha_1 * (x - tau_1) * heaviside_1
         + beta_1 * (x - tau_1) * heaviside_1
+        - beta_1 * (x - tau_2) * heaviside_2
+        + gamma_1 * (x - tau_2) * heaviside_2
         + y[0]
     )
 
-
 def model_2(data, q):
     """
-    Heaviside function model with three slope switchpoints.
-    Designed to interface with the package pymcmcstat
+    Heaviside function model with four slope switchpoints.
+    Suitable for pymcmcstat.
     """
-
-    alpha_1, delta_alpha_2, delta_beta_1, delta_beta_2, theta_1, theta_2, theta_3 = q
+    alpha_1, delta_alpha_2, delta_beta_1, delta_beta_2, gamma_1, theta_1, theta_2, theta_3, theta_4 = q
     x = data.xdata[0]
     y = data.ydata[0]
     x = x.reshape((x.shape[0],))
-    tau_min = 2
-    tau_max = x.shape[0]-2
-    delta = x.shape[0]//5
 
-    # ensures tau_1 < tau_2 < tau_3 < x.shape[0]
-    tau_1 = tau_min + (tau_max-tau_min- 2*delta) * sigmoid(theta_1)
-    tau_2 = (tau_1 + delta) + (tau_max-tau_1-2*delta) * sigmoid(theta_2)
-    tau_3 = (tau_2+delta) + (tau_max-tau_2-delta) * sigmoid(theta_3)
+    tau_min = min(x.shape[0] // 10, 2)
+    tau_max = x.shape[0]
+    delta = min(x.shape[0] // 10, 2)
 
+    # Sequential slope construction
+    beta_1 = alpha_1 - delta_beta_1         # β₁ < α₁
+    alpha_2 = beta_1 + delta_alpha_2        # α₂ > β₁
+    beta_2 = alpha_2 - delta_beta_2         # β₂ < α₂    
 
-    #biological variation
-    beta_1 = alpha_1 - delta_beta_1 #delta_beta_1 > 0
-    alpha_2 = beta_1 + delta_alpha_2 #delta_alpha_1 > 0
-    beta_2 = alpha_2 - delta_beta_2 #delta_beta_2 > 0
+    # Sequential transition points with enforced spacing
+    tau_1 = tau_min + (tau_max - tau_min - 3 * delta) * sigmoid(theta_1)
+    tau_2 = (tau_1 + delta) + (tau_max - tau_1 - 3 * delta) * sigmoid(theta_2)
+    tau_3 = (tau_2 + delta) + (tau_max - tau_2 - 2 * delta) * sigmoid(theta_3)
+    tau_4 = (tau_3 + delta) + (tau_max - tau_3 - delta) * sigmoid(theta_4)
 
     x_idx = np.arange(x.shape[0])
-    heaviside_1 = np.heaviside(x_idx - tau_1, 1)
-    heaviside_2 = np.heaviside(x_idx - tau_2, 1)
-    heaviside_3 = np.heaviside(x_idx - tau_3, 1)
+    h1 = np.heaviside(x_idx - tau_1, 1)
+    h2 = np.heaviside(x_idx - tau_2, 1)
+    h3 = np.heaviside(x_idx - tau_3, 1)
+    h4 = np.heaviside(x_idx - tau_4, 1)
 
     return (
         y[0]
         + alpha_1 * x
-        + (beta_1 - alpha_1) * (x - tau_1) * heaviside_1
-        + (alpha_2 - beta_1) * (x - tau_2) * heaviside_2
-        + (beta_2 - alpha_2) * (x - tau_3) * heaviside_3
+        + (beta_1 - alpha_1) * (x - tau_1) * h1
+        + (alpha_2 - beta_1) * (x - tau_2) * h2
+        + (beta_2 - alpha_2) * (x - tau_3) * h3
+        + (gamma_1 - beta_2) * (x - tau_4) * h4
     )
-
 
 def ssfun_1(q, data):
     """
-    Error function to compare 'model_1' with experimental data.
-    Designed to interface with the package pymcmcstat
+    Heteroscedastic error function using combined Poisson + Gaussian noise.
     """
+    a = 0.1 # Poisson noise scale
+    b = 0.01  # Gaussian noise floor
 
     ydata = data.ydata[0]
     ymodel = model_1(data, q)
     res = ymodel.reshape(ydata.shape) - ydata
-    ssr = (res**2).sum(axis=0)
+
+    sigma2 = a**2 * np.abs(ymodel) + b**2
+    ssr = np.sum((res**2) / sigma2 + np.log(sigma2))
 
     return ssr
 
 
 def ssfun_2(q, data):
     """
-    Error function to compare 'model_2' with experimental data.
-    Designed to interface with the package pymcmcstat
+    Heteroscedastic error function using combined Poisson + Gaussian noise, with penalty for short third regime.
     """
+    a = 0.1  # Poisson noise scale
+    b = 0.01  # Gaussian noise floor
+
     ydata = data.ydata[0]
     ymodel = model_2(data, q)
     res = ymodel.reshape(ydata.shape) - ydata
-    ssr = (res**2).sum(axis=0)
 
-    alpha_1, delta_alpha_2, delta_beta_1, delta_beta_2, theta_1, theta_2, theta_3 = q
-    tau_min = 2
-    tau_max = data.xdata[0].shape[0] - 2
-    delta = data.xdata[0].shape[0] // 5
+    sigma2 = a**2 * np.abs(ymodel) + b**2
+    ssr = np.sum((res**2) / sigma2 + np.log(sigma2))
 
-    tau_1 = tau_min + (tau_max - tau_min - 2*delta) * sigmoid(theta_1)
-    tau_2 = (tau_1 + delta) + (tau_max - tau_1 - 2*delta) * sigmoid(theta_2)
-    tau_3 = (tau_2 + delta) + (tau_max - tau_2 - delta) * sigmoid(theta_3)
+    alpha_1, delta_alpha_2, delta_beta_1, delta_beta_2, delta_gamma_2, theta_1, theta_2, theta_3, theta_4 = q
+    tau_min = min(data.xdata[0].shape[0] // 10, 2 )
+    delta = min(data.xdata[0].shape[0] // 10, 2 )
+
+    tau_1 = tau_min + (data.xdata[0].shape[0] - tau_min - 3 * delta) * sigmoid(theta_1)
+    tau_2 = tau_1 + delta + (data.xdata[0].shape[0] - tau_1 - 3 * delta) * sigmoid(theta_2)
+    tau_3 = tau_2 + delta + (data.xdata[0].shape[0] - tau_2 - 2 * delta) * sigmoid(theta_3)
+    tau_4 = tau_3 + delta + (data.xdata[0].shape[0] - tau_3 - delta) * sigmoid(theta_4)
+
     d_min = 20.0  # minimum acceptable segment length
-    lambda_penalty = 10000.0  # strength of the penalty
+    lambda_penalty = 100000.0  # strength of the penalty
 
     penalty = max(0, d_min - (tau_3 - tau_2))
     ssr += lambda_penalty * penalty**2
-    
+
     return ssr
 
 
+
 def compute_bic(mcstat, model_func) -> float:
-    """
-    Given a pymcmc.MCMC() instance and a model,
-    estimates the bayesian information criterion of the model with it's
-    estimated parameters. Where the parameters are estimated using
-    Markov-chain Monte Carlo.
-    """
-
-    # Number of data points
+    
     ndata = mcstat.data.ydata[0].size
-
-    # Number of parameters
     k = len(mcstat.simulation_results.results["names"])
-
-    # MAP parameter estimate (posterior mean here)
     results = mcstat.simulation_results.results
     burnin = int(results["nsimu"] / 2)
     chain = results["chain"][burnin:, :]
     map_theta = np.mean(chain, axis=0)
 
-    # Model predictions at MAP
     y_model = model_func(mcstat.data, map_theta).flatten()
-
-    # Observed data
     y_data = mcstat.data.ydata[0].flatten()
-
-    # Sum of squared residuals (SSR)
     ssr = np.sum((y_data - y_model) ** 2)
 
-    # Estimate noise variance from posterior samples
-    sigma2 = np.mean(mcstat.simulation_results.results["s2chain"])
+    # If updatesigma=True, use s2chain; otherwise fallback to SSR-based estimate
+    s2chain = results.get("s2chain")
+    if s2chain is None or np.all(s2chain == None):
+        sigma2 = ssr / ndata
+    else:
+        sigma2 = np.mean(s2chain)
 
-    # Compute log-likelihood assuming Gaussian noise
     logL = -0.5 * ndata * np.log(2 * np.pi * sigma2) - 0.5 * ssr / sigma2
-
-    # Bayesian Information Criterion (BIC)
     bic = k * np.log(ndata) - 2 * logL
-
     return bic
 
-'''
-def initial_theta_guesses(x_max):
-    """
-    Compute initial guesses for theta1, theta2, theta3
-    to ensure tau1 < tau2 < tau3 within (1, x_max-1).
-    """
-    tau_min = 2
-    tau_max = x_max - 2
-
-    # Target tau values in (tau_min, tau_max)
-    tau1 = tau_min + 0.125 * (tau_max - tau_min)
-    tau2 = tau_min + 0.25 * (tau_max - tau_min)
-    tau3 = tau_min + 0.75 * (tau_max - tau_min)
-    
-    # Logit function (inverse of sigmoid)
-    def logit(p):
-        return np.log(p / (1 - p))
-    
-    # Compute thetas to match target taus
-    theta1 = logit((tau1 - tau_min) / (tau_max - tau_min))
-    theta2 = logit((tau2 - tau1) / (tau_max - tau1))
-    theta3 = logit((tau3 - tau2) / (tau_max - tau2))
-    
-    return tau_min, tau_max, theta1, theta2, theta3
-    '''
 
 
 def bayes_fit_cycb_regimes(
@@ -332,11 +305,15 @@ def bayes_fit_cycb_regimes(
     mcstat = MCMC()
     mcstat.data.add_data_set(x, y)
     mcstat.model_settings.define_model_settings(sos_function=ssfuns[0])
-    mcstat.simulation_options.define_simulation_options(nsimu=10e3, updatesigma=True)
-    mcstat.parameters.add_model_parameter(name="alpha_1", theta0=-0.2, maximum=0, prior_mu=-0.2, prior_sigma=0.025) #low and narrow prior
-    mcstat.parameters.add_model_parameter(name="delta_beta_1", theta0=0.5, minimum=0, prior_mu=0.5, prior_sigma=0.4) #high and wide prior
+    mcstat.simulation_options.define_simulation_options(nsimu=1e4, updatesigma=False)
+    mcstat.parameters.add_model_parameter(name="alpha_1", theta0=-0.2, maximum=0, prior_mu=-0.2, prior_sigma=0.2) #low and narrow prior
+    mcstat.parameters.add_model_parameter(name="delta_beta_1", theta0=0.75, minimum=0.2, prior_mu=0.75, prior_sigma=0.75) #high and wide prior
+    mcstat.parameters.add_model_parameter(name="gamma_1", theta0=0, minimum= -1e-3, prior_mu=0, prior_sigma=0.01)
     mcstat.parameters.add_model_parameter(
-        name="theta_1", theta0=0
+        name="theta_1", theta0=2
+    ) 
+    mcstat.parameters.add_model_parameter(
+        name="theta_2", theta0=2
     ) 
     mcstat.run_simulation()
 
@@ -344,11 +321,12 @@ def bayes_fit_cycb_regimes(
     mcstat_2 = MCMC()
     mcstat_2.data.add_data_set(x, y)
     mcstat_2.model_settings.define_model_settings(sos_function=ssfuns[1])
-    mcstat_2.simulation_options.define_simulation_options(nsimu=10e4, updatesigma=True)
-    mcstat_2.parameters.add_model_parameter(name="alpha_1", theta0=-0.2, maximum=0.0, prior_mu=-0.2, prior_sigma=0.025)
-    mcstat_2.parameters.add_model_parameter(name="delta_alpha_2", theta0=0.5, minimum=0.0, prior_mu=0.5, prior_sigma=0.025)
-    mcstat_2.parameters.add_model_parameter(name="delta_beta_1", theta0=0.5, minimum=0, prior_mu=0.5, prior_sigma=0.4)
-    mcstat_2.parameters.add_model_parameter(name="delta_beta_2", theta0=0.5, minimum=0, prior_mu=0.5, prior_sigma=0.4)
+    mcstat_2.simulation_options.define_simulation_options(nsimu=10e4, updatesigma=False)
+    mcstat_2.parameters.add_model_parameter(name="alpha_1", theta0=-0.2, maximum=0.0, prior_mu=-0.2, prior_sigma=0.2)
+    mcstat_2.parameters.add_model_parameter(name="delta_alpha_2", theta0=0.75, minimum=0.2, prior_mu=0.75, prior_sigma=0.75)
+    mcstat_2.parameters.add_model_parameter(name="delta_beta_1", theta0=0.75, minimum=0.2, prior_mu=0.75, prior_sigma=0.75)
+    mcstat_2.parameters.add_model_parameter(name="delta_beta_2", theta0=0.75, minimum=0.2, prior_mu=0.75, prior_sigma=0.75)#high and wide prio
+    mcstat_2.parameters.add_model_parameter(name="gamma_1", theta0=0, minimum= -1e-3, prior_mu=0, prior_sigma=0.01)
     mcstat_2.parameters.add_model_parameter(
         name="theta_1", theta0=0, 
     )
@@ -357,6 +335,9 @@ def bayes_fit_cycb_regimes(
     )
     mcstat_2.parameters.add_model_parameter(
         name="theta_3", theta0=0, 
+    )
+    mcstat_2.parameters.add_model_parameter(
+        name="theta_4", theta0=0, 
     )
     mcstat_2.run_simulation()
 
@@ -372,55 +353,65 @@ def bayes_fit_cycb_regimes(
     chain = results["chain"][burnin:, :]
 
     params = np.mean(chain, axis=0)
-    delta = x.shape[0]//5
-    if params.shape[0] == 3:
-        tau_min = 5
-        tau_max = x.shape[0]-5
-        tau_1 = (tau_max - tau_min) * sigmoid(params[2])
+    delta = min( x.shape[0]//10, 2 )
+    tau_min = min( x.shape[0]//10, 2 )
+    tau_max = x.shape[0]
+    if params.shape[0] == 5:
+
+        theta_1 = params[3]
+        theta_2 = params[4]
+        tau_1 = tau_min + (tau_max - tau_min - delta) *sigmoid(theta_1)
+        tau_2 = (tau_1 + delta) + (tau_max - tau_1 - delta) *sigmoid(theta_2)
         return [
             params[0],
             params[0] - params[1],
+            params[2],
             tau_1,
-        ]  # alpha_1, #beta_1, #tau_1
+            tau_2
+        ]  # alpha_1, #beta_1, #gamma_1, #tau_1, #tau_2
 
-    elif params.shape[0] == 7:
-        tau_min = 2
-        tau_max = x.shape[0]-2
-        tau_1 = tau_min + (tau_max - tau_min - 2*delta) * sigmoid(params[4])
-        tau_2 = tau_1 + delta + (tau_max - tau_1 - 2*delta) * sigmoid(params[5])
-        tau_3 = tau_2 + delta + (tau_max - tau_2 - delta) * sigmoid(params[6])
+    elif params.shape[0] == 9:
+        theta_1 = params[5]
+        theta_2 = params[6]
+        theta_3 = params[7]
+        theta_4 = params[8]
+        tau_1 = tau_min + (tau_max - tau_min - 3 * delta) * sigmoid(theta_1)
+        tau_2 = (tau_1 + delta) + (tau_max - tau_1 - 3 * delta) * sigmoid(theta_2)
+        tau_3 = (tau_2 + delta) + (tau_max - tau_2 - 2 * delta) * sigmoid(theta_3)
+        tau_4 = (tau_3 + delta) + (tau_max - tau_3 - delta) * sigmoid(theta_4)
 
         alpha_1 = params[0]
         beta_1 = alpha_1 - params[2]
         alpha_2 = beta_1 + params[1]
         beta_2 = alpha_2 - params[3]
+        gamma_1 = params[4]
 
         return [
             alpha_1, 
             alpha_2,
             beta_1,
             beta_2,
+            gamma_1,
             tau_1,
             tau_2,
-            tau_3
-        ]  # alpha_1, alpha_2, beta_1, beta_2, tau_1, tau_2, tau_3
+            tau_3,
+            tau_4
+        ]  
 
 
 if __name__ == "__main__":
-
-    width = 21
-    root_dir = Path("input/root/dir")
-    inference_dirs = [
-        obj.path
-        for obj in os.scandir(root_dir)
-        if "_inference" in obj.name and obj.is_dir()
-    ]
+    
+    root_dir= Path('/nfs/turbo/umms-ajitj/anishjv/for_analysis/1/')
+    inference_dirs = [obj.path for obj in os.scandir(root_dir) if '_inference' in obj.name and obj.is_dir()]
 
     cycb_paths = []
     for dir in inference_dirs:
-        cycb_path = [obj.path for obj in os.scandir(dir) if "chromatin" in obj.name]
+        print(dir)
+        cycb_path = glob.glob(f'{dir}/*chromatin.xlsx')
         cycb_paths += cycb_path
+        
 
+    print("Will process: \n", cycb_paths)
     for cycb_path in cycb_paths:
         try:
             writer = pd.ExcelWriter(
@@ -437,15 +428,14 @@ if __name__ == "__main__":
         fit_info = []
         for i, trace in enumerate(traces):
             # cannot be smoothed or trace ends in mitosis
-            if trace.shape[0] > width and semantic[i][-1] != 1:
+            if semantic[i][-1] != 1:
                 trace[np.isnan(trace)] = 0
-                smooth_trace = savgol_filter(trace, width, 2)
             else:
                 fit_info.append(np.zeros(3))
                 continue
-
-            low_bound, high_bound = deg_interval(smooth_trace, semantic[i])
-            mit_neg_trace = smooth_trace[low_bound:high_bound]
+            
+            low_bound, high_bound = deg_interval(trace, semantic[i])
+            mit_neg_trace = trace[low_bound:high_bound]
 
             x = np.linspace(1, mit_neg_trace.shape[0], mit_neg_trace.shape[0])
             if x.shape[0] > 0:
@@ -457,15 +447,16 @@ if __name__ == "__main__":
 
             if params == None:
                 params = np.zeros(3)
-            elif len(params) == 3:
-                params[2] += low_bound
-            elif len(params) == 7:
+            elif len(params) == 5:
+                params[3] += low_bound
+                params[4] += low_bound
+            elif len(params) == 9:
                 params = [
-                    param if i < 4 else param + low_bound
+                    param if i < 5 else param + low_bound
                     for i, param in enumerate(params)
                 ]
-
             fit_info.append(tuple(params))
+
 
         fit_info = pd.DataFrame(fit_info)
         fit_info.to_excel(writer, sheet_name="fitting info")
