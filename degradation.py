@@ -23,7 +23,6 @@ from segment_chromatin import (
     unaligned_chromatin, ChromatinSegConfig
 )  # type:ignore
 
-
 def retrieve_traces(
     analysis_df: pd.DataFrame,
     wl: str,
@@ -229,7 +228,6 @@ def cycb_chromatin_batch_analyze(
             # Get chromatin segmentation data for this cell
             data_tuple = unaligned_chromatin(
                 cell_id, analysis_df, instance, chromatin,
-                frame_interval_minutes=frame_interval_minutes,
                 config=config
             )
 
@@ -259,7 +257,6 @@ def cycb_chromatin_batch_analyze(
             cell_summary_data.append({
                 'cell_id': cell_id,
                 'first_mitosis': first_tps[i],
-                'first_anaphase': data_tuple[5],
                 'n_frames': len(frames),
                 'frame_start': frames[0],
                 'frame_end': frames[-1]
