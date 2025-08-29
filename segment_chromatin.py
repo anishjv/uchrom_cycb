@@ -6,7 +6,7 @@ from scipy.ndimage import zoom
 from typing import Optional
 
 import skimage
-from skimage.morphology import disk, binary_dilation, rectangle, remove_small_objects
+from skimage.morphology import disk, binary_dilation, remove_small_objects
 from skimage.filters import threshold_otsu, gaussian, threshold_li
 from skimage.measure import label, regionprops
 from skimage.segmentation import clear_border
@@ -32,8 +32,8 @@ class ChromatinSegConfig:
     psf_size: int = 19
     gaussian_sigma: float = 0
     min_chromatin_area: int = 20
-    eccentricity_threshold: float = 0.85
-    euler_threshold: float = -5
+    eccentricity_threshold: float = 0.8 
+    euler_threshold: float = -2 #can be no more than three holes in the metaphase plate
     metaphase_dilation_size: int = 5
 
 
@@ -212,24 +212,27 @@ def get_largest_signal_regions(
     return labeled, max_intensity_lbl
 
 
-def calculate_region_orientation(region_mask: np.ndarray) -> float:
+def calculate_region_orientation(region_mask: np.ndarray, cell: np.ndarray) -> float:
     """
     Calculate the orientation angle of a region using its principal axes.
     ---------------------------------------------------------------------------------------------------------------
     INPUTS:
         region_mask: np.ndarray, boolean mask of the region
+        cell: np.ndarray, intensity image
     OUTPUTS:
         angle_degrees: float, orientation angle in degrees (0-180)
     """
     # Get region properties
-    props = regionprops(label(region_mask.astype(int)))[0]
-    
+    props = regionprops(label(region_mask.astype(int)), intensity_image = cell)[0]
+    mu20 = props.weighted_moments_central[2, 0]
+    mu02 = props.weighted_moments_central[0, 2]
+    mu11 = props.weighted_moments_central[1, 1]
+
     # Get the orientation (returns angle in radians, -π/2 to π/2)
-    # regionprops.orientation measures counter-clockwise from π/2 (vertical)
-    orientation_rad = props.orientation
-    
+    orientation_weighted_rad = 0.5 * np.arctan2(2 * mu11, mu20 - mu02)
+        
     # Convert to degrees
-    angle_degrees = np.degrees(orientation_rad)
+    angle_degrees = np.degrees(orientation_weighted_rad)
     
     # Transform from regionprops coordinate system to extractRect coordinate system:
     # regionprops: counter-clockwise from π/2 (vertical), range -90° to 90°
@@ -240,17 +243,19 @@ def calculate_region_orientation(region_mask: np.ndarray) -> float:
     return transformed_angle
 
 
-def remove_metaphase_if_eccentric(
+def remove_metaphase_plate(
     lbl: int, 
     labeled: np.ndarray,
+    cell: np.ndarray,
     config: Optional[ChromatinSegConfig] = None,
 ) -> np.ndarray:
     """
-    Removes the metaphase plate only if its eccentricity exceeds threshold using largest inscribed rectangle.
+    Removes the metaphase plate by finding the largest inscribed rectangle
     ---------------------------------------------------------------------------------------------------------------
     INPUTS:
         lbl: int, label of the region to check
         labeled: np.ndarray, labeled image
+        cell: np.ndarray, intensity image
         config: Optional[ChromatinSegConfig], configuration parameters (default=None)
     OUTPUTS:
         removal_mask: np.ndarray, boolean mask of regions to remove
@@ -280,7 +285,7 @@ def remove_metaphase_if_eccentric(
     
     try:
         # Calculate the orientation of the region mask
-        region_orientation = calculate_region_orientation(region_mask)
+        region_orientation = calculate_region_orientation(region_mask, cell)
         
         rect_coords_ori, angle_optimal, _ = findRotMaxRect(
             data_for_rect,
@@ -292,17 +297,13 @@ def remove_metaphase_if_eccentric(
             limit_image_size=1000,
             initial_angle=region_orientation
         )
+
     except Exception as e:
         print(e)
         return np.zeros_like(labeled, dtype=bool)
                     
 
     rect_coords_ori = np.asarray(rect_coords_ori)
-    width = np.linalg.norm(rect_coords_ori[1] - rect_coords_ori[0])
-    height = np.linalg.norm(rect_coords_ori[2] - rect_coords_ori[1])
-    aspect_ratio = max(height, width) / min(height, width)
-
-
     rect_transformed = np.zeros_like(rect_coords_ori)
     rect_transformed[:, 0] = rect_coords_ori[:, 1]          # swap (x, y) to (y, x)
     rect_transformed[:, 1] = rect_coords_ori[:, 0]          # swap (x, y) to (y, x)
@@ -346,8 +347,8 @@ def determine_removal_mask(
     if max_lbl is None:
         return None
 
-    removal_mask = remove_metaphase_if_eccentric(
-        max_lbl, labeled_regions, config
+    removal_mask = remove_metaphase_plate(
+        max_lbl, labeled_regions, cell, config
     )
     return removal_mask
 
@@ -598,7 +599,7 @@ def visualize_chromatin_processing(
         frame_indices = [int(i * (total_metaphase_frames - 1) / (n_rows - 1)) for i in range(n_rows)]
     
     # Create figure
-    fig, axes = plt.subplots(n_rows, 5, figsize=(12, 16), dpi=dpi)
+    fig, axes = plt.subplots(n_rows, 5, figsize=figsize, dpi=dpi)
     if n_rows == 1:
         axes = axes.reshape(1, -1)
         
@@ -808,6 +809,7 @@ if __name__ == "__main__":
             if len(cells_with_metaphase) > 0:
                 # Randomly select a cell
                 cell_id = random.choice(cells_with_metaphase)
+                cell_id = 758
                 metaphase_frames = analysis_df.query(f"particle == {cell_id} and semantic_smoothed == 1")
                 
                 print(f"Randomly selected cell {cell_id} from position {positions[0]}")
@@ -822,7 +824,7 @@ if __name__ == "__main__":
                     cell_id, analysis_df, instance, chromatin,
                     n_rows=10,  # Show 10 metaphase timepoints
                     save_path=save_path,
-                    figsize=(24, 16),
+                    figsize=(12, 16),
                     dpi=150
                 )
             else:

@@ -160,9 +160,17 @@ def findRotMaxRect(data_in,flag_opt=False,flag_parallel = False, nbre_angle=10,f
 
     if flag_opt:
         if initial_angle is not None:
-            # Use the provided initial angle as starting point for optimization
-            popt = optimize.fmin(residual, initial_angle, args=(data,), xtol=0.01, ftol=1.e-5, disp=False)
-            angle_selected = float(popt[0])  # Convert to scalar
+            # Use the provided initial angle as starting point for optimization 
+            result = optimize.minimize(
+                                residual, 
+                                initial_angle, 
+                                args=(data,), 
+                                method = 'Nelder-Mead', 
+                                bounds =  [(initial_angle-20, initial_angle+20)], 
+                                options = {'xatol': 0.01, 'fatol': 1.e-5, 'disp': False}
+                                )
+
+            angle_selected = float(result.x[0])  # Convert to scalar
         else:
             # Fall back to original brute force + optimization
             myranges_brute = ((90., 180.),)  # Fixed: should be a tuple of tuples for 1D optimization
