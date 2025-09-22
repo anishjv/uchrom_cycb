@@ -22,13 +22,14 @@ import re
 from segment_chromatin import (
     unaligned_chromatin, ChromatinSegConfig
 )  # type:ignore
+import sys
 
 def retrieve_traces(
     analysis_df: pd.DataFrame,
     wl: str,
     frame_interval: int,
     remove_end_mitosis: Optional[bool] = False,
-) -> tuple[list[npt.NDArray], list[npt.NDArray], list, list, list[npt.NDArray]]:
+) -> tuple[list[npt.NDArray], list[npt.NDArray], list, list, list[npt.NDArray], list]:
     """
     Retrieve corrected intensity and semantic traces for a channel, enforcing selection rules and experiment length constraints.
     ------------------------------------------------------------------------------------------------------
@@ -44,6 +45,7 @@ def retrieve_traces(
     	ids: list, particle identifiers retained
     	first_tps: list, indices of first mitotic call (left base of the detected peak)
     	frame_traces: list[npt.NDArray], actual frame numbers for each trace
+    	last_mitotic_tps: list, indices of last mitotic call for each trace
     """
 
     ids = []
@@ -51,6 +53,7 @@ def retrieve_traces(
     semantic_traces = []
     first_tps = []
     frame_traces = []
+    last_tps = []
     t_char = 20 // frame_interval
 
     for id in analysis_df["particle"].unique():
@@ -76,14 +79,17 @@ def retrieve_traces(
             continue
 
         first_mitosis = props["left_bases"][0]
+        last_mitosis = props["right_bases"][0]
+        
         corr_intensity = (intensity - bkg) * intensity_corr
         intensity_traces.append(corr_intensity)
         semantic_traces.append(semantic)
         frame_traces.append(frames)
         first_tps.append(first_mitosis)
+        last_tps.append(last_mitosis)
         ids.append(id)
 
-    return intensity_traces, semantic_traces, ids, first_tps, frame_traces
+    return intensity_traces, semantic_traces, ids, first_tps, frame_traces, last_tps
 
 
 def watershed_split(
@@ -203,7 +209,7 @@ def cycb_chromatin_batch_analyze(
         analysis_df.dropna(inplace=True)
 
         print(f"Working on position: {name_stub}")
-        intensity, semantic, ids, first_tps, frame_traces = retrieve_traces(
+        intensity, semantic, ids, first_tps, frame_traces, last_mitotic_tps = retrieve_traces(
             analysis_df, "GFP", int(frame_interval_minutes)
         )
 
@@ -257,9 +263,13 @@ def cycb_chromatin_batch_analyze(
             cell_summary_data.append({
                 'cell_id': cell_id,
                 'first_mitosis': first_tps[i],
+                'last_mitosis': last_mitotic_tps[i],
                 'n_frames': len(frames),
                 'frame_start': frames[0],
-                'frame_end': frames[-1]
+                'frame_end': frames[-1],
+                'num_removal_regions': data_tuple[5],
+                'first_removal_frame': data_tuple[6],
+                'last_removal_frame': data_tuple[7]
             })
         
         print(f"Created long-format dataframe with {len(degradation_data)} rows")
@@ -295,7 +305,7 @@ def cycb_chromatin_batch_analyze(
         save_dir = os.path.dirname(analysis_path)
         if not os.path.isdir(save_dir):
             save_dir = os.getcwd()
-        save_path = os.path.join(save_dir, f"{name_stub}_cycb_chromatin.xlsx")
+        save_path = os.path.join(save_dir, f"{name_stub}cycb_chromatin.xlsx")
 
         with pd.ExcelWriter(save_path, engine="openpyxl") as writer:
             # Save main data in long format (similar to cellaap_analysis.py)
@@ -307,6 +317,7 @@ def cycb_chromatin_batch_analyze(
             
             # Save combined analysis and config metadata
             analysis_config_df.to_excel(writer, sheet_name="analysis_config", index=False)
+
 
 
 if __name__ == "__main__":
@@ -325,6 +336,7 @@ if __name__ == "__main__":
         name_stub = re.search(
             r"[A-H]([1-9]|[0][1-9]|[1][0-2])_s(\d{2}|\d{1})", str(dir)
         ).group()
+        name_stub = str(name_stub) + '_'
         an_paths = glob.glob(f"{dir}/*analysis.xlsx")
         inst_paths = glob.glob(f"{dir}/*instance_movie.tif")
         chrom_paths = [
@@ -344,6 +356,7 @@ if __name__ == "__main__":
         print("Analysis paths", len(analysis_paths))
         print("Instance paths", len(instance_paths))
         print("Chromatin paths", len(chromatin_paths))
+        sys.exit(1)
     
     # Use default configuration
     cycb_chromatin_batch_analyze(

@@ -276,11 +276,9 @@ def remove_metaphase_plate(
     eccentricity = props.eccentricity
     
     if euler_number <= config.euler_threshold:
-        print(f"Metaphase plate-finding: Euler number too low ({euler_number}), not removing plate")
         return np.zeros_like(labeled, dtype=bool)
 
     if eccentricity < config.eccentricity_threshold:
-        print(f"Metaphase plate-finding: Eccentricity too low ({eccentricity}), not removing plate")
         return np.zeros_like(labeled, dtype=bool)
     
     try:
@@ -435,6 +433,34 @@ def segment_unaligned_chromosomes(
     return np.nansum(areas), np.nansum(intensities), len(areas)
 
 
+def find_contiguous_ranges(frame_list: list[int]) -> list[tuple[int, int]]:
+    """
+    Find contiguous ranges in a list of frame numbers.
+    ---------------------------------------------------------------------------------------------------------------
+    INPUTS:
+        frame_list: list[int], sorted list of frame numbers
+    OUTPUTS:
+        ranges: list[tuple[int, int]], list of (start, end) tuples for contiguous ranges
+    """
+    if not frame_list:
+        return []
+    
+    ranges = []
+    start = frame_list[0]
+    end = frame_list[0]
+    
+    for i in range(1, len(frame_list)):
+        if frame_list[i] == end + 1:
+            end = frame_list[i]
+        else:
+            ranges.append((start, end))
+            start = frame_list[i]
+            end = frame_list[i]
+    
+    ranges.append((start, end))
+    return ranges
+
+
 def measure_whole_cell(cell: np.ndarray, cell_mask: np.ndarray) -> tuple[int, float]:
 
     """
@@ -464,7 +490,7 @@ def unaligned_chromatin(
     instance: np.ndarray,
     chromatin: np.ndarray,
     config: Optional[ChromatinSegConfig] = None,
-) -> tuple[list[int], list[int], list[float], list[int], list[int]]:
+) -> tuple[list[int], list[int], list[float], list[int], list[int], int, int, int]:
 
     """
     Given an image capturing histone fluorescence, returns the area of signal emitting regions minus the
@@ -482,6 +508,9 @@ def unaligned_chromatin(
         whole_cell_intensity: list[float], total cell intensities
         num_signals: list[int], number of unaligned chromosome objects
         whole_cell_area: list[int], total cell areas
+        num_removal_regions: int, number of contiguous regions where metaphase plate was removed
+        first_removal_frame: int, first frame where metaphase plate was removed (or -1 if none)
+        last_removal_frame: int, last frame where metaphase plate was removed (or -1 if none)
     """
 
     if config is None:
@@ -491,6 +520,7 @@ def unaligned_chromatin(
     frames_data = analysis_df.query(f"particle == {identity}")
 
     results = []
+    successful_removal_frames = []  # Track frames where metaphase plate was successfully removed
     print(f"Working on cell {identity}")
 
     for _, row in frames_data.iterrows():
@@ -512,6 +542,10 @@ def unaligned_chromatin(
             if removal_mask is None:
                 print("Lost track of cell! Moving on to next cell")
                 return None
+
+            # Check if metaphase plate was successfully removed (non-zero removal mask)
+            if np.any(removal_mask):
+                successful_removal_frames.append(f)
 
             area_sig, int_sig, num_sig = segment_unaligned_chromosomes(
                 cell, tophat_cell, removal_mask, cell_mask, config
@@ -539,12 +573,30 @@ def unaligned_chromatin(
         whole_cell_area,
     ) = zip(*results)
 
+    # Calculate metaphase plate removal metrics
+    num_removal_regions = 0
+    first_removal_frame = -1
+    last_removal_frame = -1
+    
+    if successful_removal_frames:
+        successful_removal_frames.sort()
+        ranges = find_contiguous_ranges(successful_removal_frames)
+        num_removal_regions = len(ranges)
+        first_removal_frame = successful_removal_frames[0]
+        last_removal_frame = successful_removal_frames[-1]
+        print(f"Cell {identity}: Metaphase plates were removed from time point {first_removal_frame} to {last_removal_frame} in {num_removal_regions} contigous regions")
+    else:
+        print(f"Cell {identity}: No metaphase plates were removed")
+
     return (
         list(area_signal),
         list(intensity_signal),
         list(whole_cell_intensity),
         list(num_signals),
         list(whole_cell_area),
+        num_removal_regions,
+        first_removal_frame,
+        last_removal_frame,
     )
 
 

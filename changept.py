@@ -5,6 +5,7 @@ from statsmodels.nonparametric.kernel_regression import KernelReg
 from scipy.ndimage import binary_dilation
 from scipy.signal import find_peaks
 import matplotlib.pyplot as plt
+import math
 
 def falling_half_gaussian(t, A, mu, sigma):
     """
@@ -25,50 +26,33 @@ def falling_half_gaussian(t, A, mu, sigma):
     return result
 
 
-def _extract_mitotic_data(intensity, semantic, dilation_size=21):
+def _extract_mitotic_data(intensity, semantic, derivative, dilation_size=21):
     """
     Extract mitotic data and indices from dilated semantic segmentation.
     ------------------------------------------------------------------------------------------------------
     INPUTS:
     	intensity: np.ndarray, CyclinB intensity trace over time
     	semantic: np.ndarray, binary classification (1=mitotic, 0=non-mitotic)
+        derivative: np.ndarray, derivative of CyclinB intensity trace
     	dilation_size: int, size of dilation kernel (default 21 for 10 frames on each side)
     OUTPUTS:
     	mitotic_indices: np.ndarray, original indices where dilated semantic == 1
     	cycb_in_mitosis: np.ndarray, intensity values in dilated mitotic window
+        deg_rate: np.ndarray, falling limb of derivative of CyclinB trace over mitotic indices
+        max_cycb: timepoint at which CyclinB reaches maximum abundance (intensity)
     	success: bool, whether extraction was successful
     """
     dilated_semantic = binary_dilation(semantic == 1, structure=np.ones(dilation_size)).astype(int)
     mitotic_indices = np.where(dilated_semantic == 1)[0]
     cycb_in_mitosis = intensity[dilated_semantic == 1]
+    deg_rate = derivative[dilated_semantic == 1]
+    max_cycb = np.argmax(cycb_in_mitosis)
+    deg_rate = -deg_rate[max_cycb: ]
     
     if len(cycb_in_mitosis) == 0:
         return None, None, False
     
-    return mitotic_indices, cycb_in_mitosis, True
-
-
-def _calculate_degradation_rate(cycb_in_mitosis):
-    """
-    Calculate degradation rate from CyclinB intensity in mitotic window.
-    ------------------------------------------------------------------------------------------------------
-    INPUTS:
-    	cycb_in_mitosis: np.ndarray, CyclinB intensity values in mitotic window
-    OUTPUTS:
-    	max_cycb: int, index of maximum CyclinB in mitotic window
-    	deg_rate: np.ndarray, degradation rate after peak
-    	success: bool, whether calculation was successful
-    """
-    d_dx = findiff.FinDiff(0, 1, 1, acc=6)
-    max_cycb = np.argmax(cycb_in_mitosis)
-    smooth_cycb_in_mitosis = KernelReg(cycb_in_mitosis, np.arange(len(cycb_in_mitosis)), 'c', reg_type='ll', bw=[2]).fit()[0]
-    rate = d_dx(smooth_cycb_in_mitosis)
-    deg_rate = -rate[max_cycb:]
-    
-    if len(deg_rate) == 0:
-        return None, None, False
-    
-    return max_cycb, deg_rate, True
+    return mitotic_indices, cycb_in_mitosis, deg_rate, max_cycb, True
 
 
 def _extract_falling_limb(deg_rate):
@@ -91,7 +75,7 @@ def _extract_falling_limb(deg_rate):
     return max_deg, deg_rate_fall, True
 
 
-def gauss_changept(intensity, semantic):
+def gauss_changept(smooth_intensity, derivative, semantic):
     """
     Detect change point in CyclinB degradation by fitting half-gaussian to falling degradation rate.
     ------------------------------------------------------------------------------------------------------
@@ -104,17 +88,11 @@ def gauss_changept(intensity, semantic):
 
     try:
         # Extract mitotic data
-        mitotic_indices, cycb_in_mitosis, success = _extract_mitotic_data(intensity, semantic)
+        mitotic_indices, cycb_in_mitosis, deg_rate, max_cycb, success = _extract_mitotic_data(smooth_intensity, semantic, derivative)
         if not success:
             print("[gauss_changept] No mitotic data found in semantic trace")
             return np.nan
-        
-        # Calculate degradation rate
-        max_cycb, deg_rate, success = _calculate_degradation_rate(cycb_in_mitosis)
-        if not success:
-            print("[gauss_changept] No degradation data found after peak")
-            return np.nan
-        
+                
         # Extract falling limb
         max_deg, deg_rate_fall, success = _extract_falling_limb(deg_rate)
         if not success:
@@ -127,7 +105,7 @@ def gauss_changept(intensity, semantic):
         mu0 = 0                            # mu should be 0 for t (start of falling limb)
         sigma0 = len(deg_rate_fall) / 4    # reasonable initial guess for sigma
 
-        popt, pcov = curve_fit(falling_half_gaussian, t, deg_rate_fall, p0=[A0, mu0, sigma0])
+        popt, _ = curve_fit(falling_half_gaussian, t, deg_rate_fall, p0=[A0, mu0, sigma0])
         _, mu_fit, sigma_fit = popt
         
         # Calculate fit quality metrics
@@ -152,7 +130,8 @@ def gauss_changept(intensity, semantic):
         
         return changept
         
-    except Exception:
+    except Exception as error:
+        print(error)
         print("[gauss_changept] Curve fitting failed")
         return np.nan
 
@@ -161,7 +140,7 @@ def gauss_changept(intensity, semantic):
 # The gaussian fitting method (gauss_changept) is the recommended approach
 
 
-def visualize_changepts(intensities, semantics, changepts, max_plots=6):
+def visualize_changepts(intensities, semantics, derivatives, changepts, max_plots=12):
     """
     Visualize CyclinB traces, degradation rates, and change points on single plots.
     ------------------------------------------------------------------------------------------------------
@@ -182,22 +161,24 @@ def visualize_changepts(intensities, semantics, changepts, max_plots=6):
     np.random.seed(42)  # You can change this seed value
     random_indices = np.random.choice(n_total, size=n_plots, replace=False)
     
-    # Create subplots in a 2x3 grid for 6 plots
-    fig, axes = plt.subplots(2, 3, figsize=(15, 8))
+    # Create subplots grid sized to number of plots requested
+    n_rows = math.ceil(n_plots / 3)
+    fig, axes = plt.subplots(n_rows, 3, figsize=(15, 8))
     axes = axes.flatten()  # Flatten to 1D array for easier indexing
     
     for i, idx in enumerate(random_indices):
         intensity = intensities[idx]
         semantic = semantics[idx]
         changept = changepts[idx]
+        derivative = derivatives[idx]
         
         # Extract data using helper functions
-        mitotic_indices, cycb_in_mitosis, success = _extract_mitotic_data(intensity, semantic)
+        mitotic_indices, cycb_in_mitosis, deg_rate, max_cycb, success = _extract_mitotic_data(intensity, semantic, derivative)
         
         if not success:
             # Plot original trace if no mitotic data
             axes[i].plot(intensity, 'b-', label='CyclinB')
-            axes[i].set_title(f'Trace {i+1}: No mitotic data')
+            #axes[i].set_title(f'Trace {i+1}: No mitotic data')
             continue
         
         # Create twin axes for dual y-axis plot
@@ -206,9 +187,6 @@ def visualize_changepts(intensities, semantics, changepts, max_plots=6):
         
         # Plot CyclinB trace in dilated window (left y-axis)
         line1 = ax1.plot(mitotic_indices, cycb_in_mitosis, color='#9A3324', label='CyclinB', linewidth=2)
-        
-        # Calculate and plot degradation rate (right y-axis)
-        max_cycb, deg_rate, success = _calculate_degradation_rate(cycb_in_mitosis)
         
         if success:
             deg_indices = mitotic_indices[max_cycb:]
@@ -230,11 +208,11 @@ def visualize_changepts(intensities, semantics, changepts, max_plots=6):
         lines2, labels2 = ax2.get_legend_handles_labels()
         ax1.legend(lines1 + lines2, labels1 + labels2, loc='lower left')
     
-    # Hide unused subplots
-    for i in range(n_plots, 6):
+    # Hide unused subplots in the created grid
+    total_axes = n_rows * 3
+    for i in range(n_plots, total_axes):
         axes[i].set_visible(False)
     
     plt.tight_layout()
-    plt.show()
 
     return fig
