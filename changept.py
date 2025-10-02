@@ -136,9 +136,91 @@ def gauss_changept(smooth_intensity, derivative, semantic):
         return np.nan
 
 
-# DEPRECATED: Curvature-based change point detection has been removed due to poor performance
-# The gaussian fitting method (gauss_changept) is the recommended approach
+def peaks_changept(intensity, derivative, semantic):
+    """
+    Detect change point using local minima detection in focused derivative trace.
+    ------------------------------------------------------------------------------------------------------
+    INPUTS:
+    	intensity: np.ndarray, CyclinB intensity trace over time
+    	derivative: np.ndarray, derivative of CyclinB intensity trace
+    	semantic: np.ndarray, binary classification (1=mitotic, 0=non-mitotic)
+    OUTPUTS:
+    	changept: float, estimated change point based on left base of most prominent local minimum, or np.nan if error
+    """
+    
+    try:
+        # Find mitotic indices
+        mitotic_indices = np.where(semantic == 1)[0]
+        
+        if len(mitotic_indices) == 0:
+            print("[peaks_changept] No mitotic data found in semantic trace")
+            return np.nan
 
+        is_valid, results = validate_cyclin_b_trace(intensity)
+        res = {key:value for key, value in results.items() if value==False}
+        if not is_valid:
+            print(f"[peaks_changept] Not a cyclin B trace {res}")
+            return np.nan
+        
+        # Get intensity values in mitotic window
+        intensity_in_mitosis = intensity[semantic == 1]
+ 
+        # Find maximum intensity within mitotic window
+        max_intensity_idx = np.argmax(intensity_in_mitosis)
+        max_intensity_global_idx = mitotic_indices[max_intensity_idx]
+        
+        # Find last mitotic timepoint
+        last_mitotic_idx = mitotic_indices[-1]
+        
+        # Focus on derivative trace between max intensity and last mitotic timepoint
+        start_idx = max_intensity_global_idx
+        end_idx = last_mitotic_idx + 1  # +1 to include last point
+        
+        if start_idx >= end_idx:
+            print("[peaks_changept] Invalid time window: max intensity at or after last mitotic point")
+            return np.nan
+        
+        focused_derivative = derivative[start_idx:end_idx]
+        
+        if len(focused_derivative) < 3: #12 minutes
+            print("[peaks_changept] Insufficient data in focused derivative window")
+            return np.nan
+        
+        # Find local minima (peaks in negative derivative)
+        neg_derivative = -focused_derivative
+        peaks, properties = find_peaks(neg_derivative, width=0)
+        
+        if len(peaks) == 0:
+            print("[peaks_changept] No local minima found in focused derivative")
+            return np.nan
+        
+        # Find the tallest peak (minimum in derivative)
+        peak_heights = neg_derivative[peaks]
+        tallest_peak_idx = np.argmax(peak_heights)
+        tallest_peak = peaks[tallest_peak_idx]
+        
+        # Get the left intersection of the peak's half maximum width
+        left_ips = properties['left_ips']
+        left_ip_relative = left_ips[tallest_peak_idx]
+        
+        # Convert back to original array indexing
+        changept = start_idx + left_ip_relative
+        
+        # Validate that changept is within reasonable bounds
+        if changept < 0 or changept >= len(intensity):
+            print("[peaks_changept] Change point outside valid range")
+            return np.nan
+        
+        return float(changept)
+        
+    except Exception as error:
+        print(error)
+        print("[peaks_changept] Peak detection failed")
+        return np.nan
+
+
+# DEPRECATED: Curvature-based change point detection has been removed due to poor performance
+# The gaussian fitting method (gauss_changept) and peak detection method (peaks_changept) are available
 
 def visualize_changepts(intensities, semantics, derivatives, changepts, max_plots=12):
     """
@@ -157,9 +239,9 @@ def visualize_changepts(intensities, semantics, derivatives, changepts, max_plot
     n_plots = min(n_total, max_plots)
     
     # Generate random indices without replacement
-    # Use a fixed seed for reproducible plots when comparing methods
-    np.random.seed(42)  # You can change this seed value
+    # Random seed for different selection each time
     random_indices = np.random.choice(n_total, size=n_plots, replace=False)
+    print(f"Displaying cells {random_indices}")
     
     # Create subplots grid sized to number of plots requested
     n_rows = math.ceil(n_plots / 3)
@@ -216,3 +298,54 @@ def visualize_changepts(intensities, semantics, derivatives, changepts, max_plot
     plt.tight_layout()
 
     return fig
+
+
+def validate_cyclin_b_trace(trace):
+    """
+    Validates whether a given trace is truly a cyclin B trace based on specific criteria.
+    ------------------------------------------------------------------------------------------------------
+    INPUTS:
+    	trace: np.ndarray, cyclin B intensity trace over time
+    OUTPUTS:
+    	is_valid: bool, True if trace passes 2/3 validation criteria, False otherwise
+    	criteria_results: dict, detailed results for each criterion
+    """
+    criteria_results = {
+        'peak_prominence': False,
+        'range_sufficient': False,
+        'left_base_higher': False
+    }
+    
+    # Criterion 1: Check for peak with prominence > 5
+    peaks, properties = find_peaks(trace, prominence=5, width=0)
+    if len(peaks) >= 1:
+        criteria_results['peak_prominence'] = True
+    
+    # Criterion 2: Check if range > 10
+    trace_range = np.max(trace) - np.min(trace)
+    if trace_range > 10:
+        criteria_results['range_sufficient'] = True
+    
+    # Criterion 3: Check left base > right base for main (tallest) peak
+    if len(peaks) >= 1:
+        # Find the tallest peak (highest prominence)
+        prominences = properties['prominences']
+        tallest_peak_idx = np.argmax(prominences)
+        tallest_peak = peaks[tallest_peak_idx]
+        
+        # Get left and right bases for the tallest peak
+        left_bases = properties['left_bases']
+        right_bases = properties['right_bases']
+        
+        left_base_value = trace[left_bases[tallest_peak_idx]]
+        right_base_value = trace[right_bases[tallest_peak_idx]]
+        
+        if left_base_value > right_base_value:
+            criteria_results['left_base_higher'] = True
+    
+    # Check if 2/3 criteria are met
+    passed_criteria = sum(criteria_results.values())
+    is_valid = passed_criteria >= 2
+    
+    return is_valid, criteria_results
+        

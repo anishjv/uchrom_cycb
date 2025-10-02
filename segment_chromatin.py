@@ -388,16 +388,19 @@ def segment_mask_unaligned(
     
     # Clear border objects (this will remove objects touching the image border)
     labeled = clear_border(labeled)
+
+    total_chromatin_mask = tophat_cell > thresh
+    total_chromatin_mask[~cell_mask] = 0
     
-    return labeled
+    return labeled, total_chromatin_mask
 
 
 def segment_unaligned_chromosomes(
     cell: np.ndarray, tophat_cell: np.ndarray, removal_mask: np.ndarray, cell_mask: np.ndarray, config: Optional[ChromatinSegConfig] = None
-) -> tuple[int, int, int]:
+) -> tuple[int, int, int, int, float]:
 
     """
-    Segments and measures properties of unaligned chromosomes.
+    Segments and measures properties of unaligned chromosomes and total chromatin.
     ---------------------------------------------------------------------------------------------------------------
     INPUTS:
         cell: np.ndarray, cropped chromatin image (for intensity measurements)
@@ -409,17 +412,24 @@ def segment_unaligned_chromosomes(
         total_area: int, total area of unaligned chromosomes
         total_intensity: int, total intensity of unaligned chromosomes
         object_count: int, number of unaligned chromosome objects
+        total_chromatin_area: int, total area of chromatin above threshold
+        total_chromatin_intensity: float, total intensity of chromatin above threshold
     """
 
     if config is None:
         config = ChromatinSegConfig()
     
-    labeled = segment_mask_unaligned(removal_mask, tophat_cell, cell_mask)
+    labeled, total_chromatin_mask = segment_mask_unaligned(removal_mask, tophat_cell, cell_mask)
+    
+    # Compute total chromatin measurements from the mask
+    total_chromatin_area = np.nansum(total_chromatin_mask)
+    total_chromatin_intensity = np.nansum(cell[total_chromatin_mask])
+    
     # Get the actual labels present in the image (after clear_border may have removed some)
     labels = np.unique(labeled[labeled > 0])
     
     if labels.size == 0:
-        return 0, 0, 0
+        return 0, 0, 0, total_chromatin_area, total_chromatin_intensity
 
     areas, intensities = [], []
     for lbl in labels:
@@ -430,7 +440,7 @@ def segment_unaligned_chromosomes(
             areas.append(area)
             intensities.append(intensity)
 
-    return np.nansum(areas), np.nansum(intensities), len(areas)
+    return np.nansum(areas), np.nansum(intensities), len(areas), total_chromatin_area, total_chromatin_intensity
 
 
 def find_contiguous_ranges(frame_list: list[int]) -> list[tuple[int, int]]:
@@ -461,27 +471,6 @@ def find_contiguous_ranges(frame_list: list[int]) -> list[tuple[int, int]]:
     return ranges
 
 
-def measure_whole_cell(cell: np.ndarray, cell_mask: np.ndarray) -> tuple[int, float]:
-
-    """
-    Measures whole cell area and total intensity within the cell mask.
-    ---------------------------------------------------------------------------------------------------------------
-    INPUTS:
-        cell: np.ndarray, cropped chromatin image
-        cell_mask: np.ndarray, boolean mask defining the cell boundary
-    OUTPUTS:
-        area: int, number of pixels above threshold within the cell mask
-        intensity: float, total intensity of pixels above threshold within the cell mask
-    """
-
-    # Only consider pixels within the cell mask
-    masked_cell = cell * cell_mask
-    
-    # Apply threshold only to pixels within the cell mask
-    thresh = threshold_otsu(masked_cell[masked_cell > 0])  # Only threshold non-zero pixels
-    above_thresh = masked_cell > thresh
-    
-    return np.nansum(above_thresh), np.nansum(cell[above_thresh])
 
 
 def unaligned_chromatin(
@@ -505,9 +494,9 @@ def unaligned_chromatin(
     OUTPUTS:
         area_signal: list[int], areas of unaligned chromosome regions
         intensity_signal: list[int], intensities of unaligned chromosome regions
-        whole_cell_intensity: list[float], total cell intensities
+        total_chromatin_intensity: list[float], total chromatin intensities
         num_signals: list[int], number of unaligned chromosome objects
-        whole_cell_area: list[int], total cell areas
+        total_chromatin_area: list[int], total chromatin areas
         num_removal_regions: int, number of contiguous regions where metaphase plate was removed
         first_removal_frame: int, first frame where metaphase plate was removed (or -1 if none)
         last_removal_frame: int, last frame where metaphase plate was removed (or -1 if none)
@@ -547,30 +536,29 @@ def unaligned_chromatin(
             if np.any(removal_mask):
                 successful_removal_frames.append(f)
 
-            area_sig, int_sig, num_sig = segment_unaligned_chromosomes(
+            area_sig, int_sig, num_sig, total_chromatin_area, total_chromatin_intensity = segment_unaligned_chromosomes(
                 cell, tophat_cell, removal_mask, cell_mask, config
             )
         else:
             area_sig, int_sig, num_sig = 0, 0, 0
-
-        whole_area, whole_intensity = measure_whole_cell(cell, cell_mask)
+            total_chromatin_area, total_chromatin_intensity = 0, 0.0
 
         results.append(
             (
                 area_sig,
                 int_sig,
-                whole_intensity,
+                total_chromatin_intensity,
                 num_sig,
-                whole_area,
+                total_chromatin_area,
             )
         )
 
     (
         area_signal,
         intensity_signal,
-        whole_cell_intensity,
+        total_chromatin_intensity,
         num_signals,
-        whole_cell_area,
+        total_chromatin_area,
     ) = zip(*results)
 
     # Calculate metaphase plate removal metrics
@@ -591,9 +579,9 @@ def unaligned_chromatin(
     return (
         list(area_signal),
         list(intensity_signal),
-        list(whole_cell_intensity),
+        list(total_chromatin_intensity),
         list(num_signals),
-        list(whole_cell_area),
+        list(total_chromatin_area),
         num_removal_regions,
         first_removal_frame,
         last_removal_frame,
@@ -737,7 +725,7 @@ def visualize_chromatin_processing(
         
         # Column 5: Unaligned chromosomes
         if removal_mask is not None:
-            labeled_chromosomes = segment_mask_unaligned(
+            labeled_chromosomes, _ = segment_mask_unaligned(
                 removal_mask, tophat_cell, cell_mask, config
             )
 
