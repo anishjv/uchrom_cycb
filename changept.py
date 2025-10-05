@@ -155,12 +155,6 @@ def peaks_changept(intensity, derivative, semantic):
         if len(mitotic_indices) == 0:
             print("[peaks_changept] No mitotic data found in semantic trace")
             return np.nan
-
-        is_valid, results = validate_cyclin_b_trace(intensity)
-        res = {key:value for key, value in results.items() if value==False}
-        if not is_valid:
-            print(f"[peaks_changept] Not a cyclin B trace {res}")
-            return np.nan
         
         # Get intensity values in mitotic window
         intensity_in_mitosis = intensity[semantic == 1]

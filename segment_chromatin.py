@@ -23,22 +23,26 @@ import re
 import tifffile as tiff
 import random
 from PIL import Image
+from deg_analysis import save_chromatin_crops
+import h5py
 
 
 @dataclass
 class ChromatinSegConfig:
     """Configuration for chromatin segmentation parameters."""
+
     top_hat_radius: int = 11
     psf_size: int = 19
     gaussian_sigma: float = 0
     min_chromatin_area: int = 20
-    eccentricity_threshold: float = 0.8 
-    euler_threshold: float = -2 #can be no more than three holes in the metaphase plate
+    eccentricity_threshold: float = 0.8
+    euler_threshold: float = (
+        -2
+    )  # can be no more than three holes in the metaphase plate
     metaphase_dilation_size: int = 5
 
 
-def airy_disk_psf(NA, wavelength_nm, pixel_size_um, psf_size = 51, oversample=1):
-
+def airy_disk_psf(NA, wavelength_nm, pixel_size_um, psf_size=51, oversample=1):
     """
     Generate a 2D Airy disk PSF (diffraction-limited) for a widefield microscope.
     ---------------------------------------------------------------------------------------------------------------
@@ -67,10 +71,11 @@ def airy_disk_psf(NA, wavelength_nm, pixel_size_um, psf_size = 51, oversample=1)
 
     kr = k * R
     kr[kr == 0] = 1e-10  # avoid divide by zero
-    airy = (2 * j1(kr) / kr)**2
+    airy = (2 * j1(kr) / kr) ** 2
 
     psf = airy
     return psf
+
 
 def adjust_zoom_factor(
     chromatin_shape: tuple[int, int, int], instance_shape: tuple[int, int, int]
@@ -92,6 +97,7 @@ def adjust_zoom_factor(
         return chromatin_shape[2] / instance_shape[2]
     except AssertionError:
         raise ValueError("Chromatin and Instance must be square arrays")
+
 
 def bbox(img: npt.NDArray, expansion_factor: Optional[float] = 0) -> tuple[int]:
     """
@@ -117,11 +123,11 @@ def bbox(img: npt.NDArray, expansion_factor: Optional[float] = 0) -> tuple[int]:
     if expansion_factor > 0:
         height = rmax - rmin
         width = cmax - cmin
-        
+
         # Calculate expansion in pixels
         row_expansion = int(height * expansion_factor)
         col_expansion = int(width * expansion_factor)
-        
+
         # Expand the bounding box
         rmin = max(0, rmin - row_expansion)
         rmax = min(img.shape[0], rmax + row_expansion)
@@ -129,6 +135,7 @@ def bbox(img: npt.NDArray, expansion_factor: Optional[float] = 0) -> tuple[int]:
         cmax = min(img.shape[1], cmax + col_expansion)
 
     return rmin, rmax, cmin, cmax
+
 
 def compute_cell_images(
     instance: np.ndarray,
@@ -157,29 +164,38 @@ def compute_cell_images(
     """
     if config is None:
         config = ChromatinSegConfig()
-    
+
     mask = instance[frame] == label_id
     if zoom_factor != 1:
         mask = zoom(mask, zoom_factor, order=0)
     bbox_coords = bbox(mask, expansion_factor=0.25)
-    mask_cropped = mask[bbox_coords[0]:bbox_coords[1], bbox_coords[2]:bbox_coords[3]]
-    
+    mask_cropped = mask[
+        bbox_coords[0] : bbox_coords[1], bbox_coords[2] : bbox_coords[3]
+    ]
+
     # Get the cropped cell image
     rmin, rmax, cmin, cmax = bbox_coords
     cell = chromatin[frame, rmin:rmax, cmin:cmax]
-    
+
     # Processing pipeline for segmentation:
     # 1. Gaussian smoothing to reduce noise
     smoothed_cell = gaussian(cell, sigma=config.gaussian_sigma)
-    
+
     # 2. Deconvolution to improve resolution
     min_im_dim = min(smoothed_cell.shape[0], smoothed_cell.shape[1])
-    psf = airy_disk_psf(NA=0.45, wavelength_nm=624, pixel_size_um=0.3387, psf_size=min(config.psf_size, min_im_dim))
+    psf = airy_disk_psf(
+        NA=0.45,
+        wavelength_nm=624,
+        pixel_size_um=0.3387,
+        psf_size=min(config.psf_size, min_im_dim),
+    )
     deconv_cell = richardson_lucy(smoothed_cell, psf, num_iter=5)
-    
+
     # 3. Top-hat filtering on deconvolved image for better structure enhancement
-    tophat_cell = skimage.morphology.white_tophat(deconv_cell, disk(config.top_hat_radius))
-    
+    tophat_cell = skimage.morphology.white_tophat(
+        deconv_cell, disk(config.top_hat_radius)
+    )
+
     return cell, tophat_cell, mask_cropped, deconv_cell
 
 
@@ -196,16 +212,16 @@ def get_largest_signal_regions(
         labeled: np.ndarray, labeled image with background = 0
         max_intensity_lbl: int or None, label of the brightest region
     """
-    thresh = threshold_otsu(tophat_cell) 
+    thresh = threshold_otsu(tophat_cell)
     thresh_cell = tophat_cell > thresh
-    labeled, num_labels = label(thresh_cell, return_num=True, connectivity = 1)
-    
+    labeled, num_labels = label(thresh_cell, return_num=True, connectivity=1)
+
     if num_labels == 0:
         return labeled, None
-    
+
     labels = np.linspace(1, num_labels, num_labels).astype(int)
     region_intensities = [np.nansum(cell[labeled == (lbl)]) for lbl in labels]
-    
+
     max_intensity = max(region_intensities)
     max_intensity_lbl = labels[region_intensities.index(max_intensity)]
 
@@ -223,28 +239,28 @@ def calculate_region_orientation(region_mask: np.ndarray, cell: np.ndarray) -> f
         angle_degrees: float, orientation angle in degrees (0-180)
     """
     # Get region properties
-    props = regionprops(label(region_mask.astype(int)), intensity_image = cell)[0]
+    props = regionprops(label(region_mask.astype(int)), intensity_image=cell)[0]
     mu20 = props.weighted_moments_central[2, 0]
     mu02 = props.weighted_moments_central[0, 2]
     mu11 = props.weighted_moments_central[1, 1]
 
     # Get the orientation (returns angle in radians, -π/2 to π/2)
     orientation_weighted_rad = 0.5 * np.arctan2(2 * mu11, mu20 - mu02)
-        
+
     # Convert to degrees
     angle_degrees = np.degrees(orientation_weighted_rad)
-    
+
     # Transform from regionprops coordinate system to extractRect coordinate system:
     # regionprops: counter-clockwise from π/2 (vertical), range -90° to 90°
     # extractRect: clockwise from 0 (horizontal), range 0° to 180°
     # Transformation: flip direction and shift reference
     transformed_angle = (-angle_degrees + 90) % 180
-    
+
     return transformed_angle
 
 
 def remove_metaphase_plate(
-    lbl: int, 
+    lbl: int,
     labeled: np.ndarray,
     cell: np.ndarray,
     config: Optional[ChromatinSegConfig] = None,
@@ -262,10 +278,10 @@ def remove_metaphase_plate(
     """
     if config is None:
         config = ChromatinSegConfig()
-    
+
     region_mask = np.zeros_like(labeled, dtype=bool)
     region_mask[labeled == lbl] = 1
-    
+
     # Convert to format expected by findRotMaxRect (0=foreground, 1=background)
     data_for_rect = np.ones_like(region_mask, dtype=int)
     data_for_rect[region_mask] = 0
@@ -274,57 +290,58 @@ def remove_metaphase_plate(
     props = regionprops(label(region_mask.astype(int)))[0]
     euler_number = props.euler_number
     eccentricity = props.eccentricity
-    
+
     if euler_number <= config.euler_threshold:
         return np.zeros_like(labeled, dtype=bool)
 
     if eccentricity < config.eccentricity_threshold:
         return np.zeros_like(labeled, dtype=bool)
-    
+
     try:
         # Calculate the orientation of the region mask
         region_orientation = calculate_region_orientation(region_mask, cell)
-        
+
         rect_coords_ori, angle_optimal, _ = findRotMaxRect(
             data_for_rect,
             flag_opt=True,
             nbre_angle=20,
             flag_parallel=False,
-            flag_out='rotation',
+            flag_out="rotation",
             flag_enlarge_img=False,
             limit_image_size=1000,
-            initial_angle=region_orientation
+            initial_angle=region_orientation,
         )
 
     except Exception as e:
         print(e)
         return np.zeros_like(labeled, dtype=bool)
-                    
 
     rect_coords_ori = np.asarray(rect_coords_ori)
     rect_transformed = np.zeros_like(rect_coords_ori)
-    rect_transformed[:, 0] = rect_coords_ori[:, 1]          # swap (x, y) to (y, x)
-    rect_transformed[:, 1] = rect_coords_ori[:, 0]          # swap (x, y) to (y, x)
-    rect_transformed = np.asarray(rect_transformed, dtype = np.int64)
+    rect_transformed[:, 0] = rect_coords_ori[:, 1]  # swap (x, y) to (y, x)
+    rect_transformed[:, 1] = rect_coords_ori[:, 0]  # swap (x, y) to (y, x)
+    rect_transformed = np.asarray(rect_transformed, dtype=np.int64)
 
-    rect_mask = np.zeros_like(labeled, dtype = 'uint8')
-    cv2.fillPoly(rect_mask, [rect_transformed], 255).astype('bool')
+    rect_mask = np.zeros_like(labeled, dtype="uint8")
+    cv2.fillPoly(rect_mask, [rect_transformed], 255).astype("bool")
 
-    #create custom structuring element
-    new_shape = (rect_mask.shape[0]//1, rect_mask.shape[0]//1)
-    struct = np.asarray(
-        Image.fromarray(rect_mask).resize(new_shape)
-    )
+    # create custom structuring element
+    new_shape = (rect_mask.shape[0] // 1, rect_mask.shape[0] // 1)
+    struct = np.asarray(Image.fromarray(rect_mask).resize(new_shape))
     bbox_coords = bbox(struct)
-    struct = struct[bbox_coords[0]:bbox_coords[1], bbox_coords[2]:bbox_coords[3]] #for efficiency
-    rect_mask = binary_dilation(rect_mask, struct) #dilate to approach size of circumscribed (not inscribed) rectangle
+    struct = struct[
+        bbox_coords[0] : bbox_coords[1], bbox_coords[2] : bbox_coords[3]
+    ]  # for efficiency
+    rect_mask = binary_dilation(
+        rect_mask, struct
+    )  # dilate to approach size of circumscribed (not inscribed) rectangle
 
     return rect_mask
-          
-            
+
+
 def determine_removal_mask(
-    tophat_cell: np.ndarray, 
-    cell: np.ndarray, 
+    tophat_cell: np.ndarray,
+    cell: np.ndarray,
     config: Optional[ChromatinSegConfig] = None,
 ) -> Optional[np.ndarray]:
     """
@@ -339,23 +356,21 @@ def determine_removal_mask(
     """
     if config is None:
         config = ChromatinSegConfig()
-    
+
     labeled_regions, max_lbl = get_largest_signal_regions(tophat_cell, cell)
 
     if max_lbl is None:
         return None
 
-    removal_mask = remove_metaphase_plate(
-        max_lbl, labeled_regions, cell, config
-    )
+    removal_mask = remove_metaphase_plate(max_lbl, labeled_regions, cell, config)
     return removal_mask
 
 
 def segment_mask_unaligned(
-    removal_mask: np.ndarray, 
-    tophat_cell: np.ndarray, 
+    removal_mask: np.ndarray,
+    tophat_cell: np.ndarray,
     cell_mask: np.ndarray,
-    config: Optional[ChromatinSegConfig] = None
+    config: Optional[ChromatinSegConfig] = None,
 ) -> np.ndarray:
     """
     Build a labeled image of unaligned chromosomes by removing structures from deconvolved image,
@@ -379,26 +394,29 @@ def segment_mask_unaligned(
 
     # Threshold the image
     thresh = threshold_li(cell_minus_struct[cell_minus_struct > 0])
-    labeled = label(cell_minus_struct > thresh, connectivity = 1)
-    labeled = remove_small_objects(labeled, min_size = config.min_chromatin_area)
-    
+    labeled = label(cell_minus_struct > thresh, connectivity=1)
+    labeled = remove_small_objects(labeled, min_size=config.min_chromatin_area)
+
     # Only keep objects that are within the cell mask
     # Set any labeled regions outside the cell mask to 0
     labeled[~cell_mask] = 0
-    
+
     # Clear border objects (this will remove objects touching the image border)
     labeled = clear_border(labeled)
 
     total_chromatin_mask = tophat_cell > thresh
     total_chromatin_mask[~cell_mask] = 0
-    
+
     return labeled, total_chromatin_mask
 
 
 def segment_unaligned_chromosomes(
-    cell: np.ndarray, tophat_cell: np.ndarray, removal_mask: np.ndarray, cell_mask: np.ndarray, config: Optional[ChromatinSegConfig] = None
-) -> tuple[int, int, int, int, float]:
-
+    cell: np.ndarray,
+    tophat_cell: np.ndarray,
+    removal_mask: np.ndarray,
+    cell_mask: np.ndarray,
+    config: Optional[ChromatinSegConfig] = None,
+):
     """
     Segments and measures properties of unaligned chromosomes and total chromatin.
     ---------------------------------------------------------------------------------------------------------------
@@ -418,18 +436,21 @@ def segment_unaligned_chromosomes(
 
     if config is None:
         config = ChromatinSegConfig()
-    
-    labeled, total_chromatin_mask = segment_mask_unaligned(removal_mask, tophat_cell, cell_mask)
-    
+
+    labeled, total_chromatin_mask = segment_mask_unaligned(
+        removal_mask, tophat_cell, cell_mask
+    )
+
     # Compute total chromatin measurements from the mask
     total_chromatin_area = np.nansum(total_chromatin_mask)
     total_chromatin_intensity = np.nansum(cell[total_chromatin_mask])
-    
+
     # Get the actual labels present in the image (after clear_border may have removed some)
     labels = np.unique(labeled[labeled > 0])
-    
+
     if labels.size == 0:
-        return 0, 0, 0, total_chromatin_area, total_chromatin_intensity
+        measurements = (0, 0, 0, total_chromatin_area, total_chromatin_intensity)
+        return measurements, labeled
 
     areas, intensities = [], []
     for lbl in labels:
@@ -440,7 +461,15 @@ def segment_unaligned_chromosomes(
             areas.append(area)
             intensities.append(intensity)
 
-    return np.nansum(areas), np.nansum(intensities), len(areas), total_chromatin_area, total_chromatin_intensity
+    measurements = (
+        np.nansum(areas),
+        np.nansum(intensities),
+        len(areas),
+        total_chromatin_area,
+        total_chromatin_intensity,
+    )
+
+    return measurements, labeled
 
 
 def find_contiguous_ranges(frame_list: list[int]) -> list[tuple[int, int]]:
@@ -454,11 +483,11 @@ def find_contiguous_ranges(frame_list: list[int]) -> list[tuple[int, int]]:
     """
     if not frame_list:
         return []
-    
+
     ranges = []
     start = frame_list[0]
     end = frame_list[0]
-    
+
     for i in range(1, len(frame_list)):
         if frame_list[i] == end + 1:
             end = frame_list[i]
@@ -466,11 +495,9 @@ def find_contiguous_ranges(frame_list: list[int]) -> list[tuple[int, int]]:
             ranges.append((start, end))
             start = frame_list[i]
             end = frame_list[i]
-    
+
     ranges.append((start, end))
     return ranges
-
-
 
 
 def unaligned_chromatin(
@@ -479,8 +506,7 @@ def unaligned_chromatin(
     instance: np.ndarray,
     chromatin: np.ndarray,
     config: Optional[ChromatinSegConfig] = None,
-) -> tuple[list[int], list[int], list[float], list[int], list[int], int, int, int]:
-
+) -> tuple[list[int], list[int], list[float], list[int], list[int], int, int, int] | None:
     """
     Given an image capturing histone fluorescence, returns the area of signal emitting regions minus the
     area of the largest signal emitting region (corresponds with unaligned chromosomes in metaphase).
@@ -504,13 +530,17 @@ def unaligned_chromatin(
 
     if config is None:
         config = ChromatinSegConfig()
-    
+
     zoom_factor = adjust_zoom_factor(chromatin.shape, instance.shape)
     frames_data = analysis_df.query(f"particle == {identity}")
 
     results = []
-    successful_removal_frames = []  # Track frames where metaphase plate was successfully removed
+    successful_removal_frames = (
+        []
+    )  # Track frames where metaphase plate was successfully removed
     print(f"Working on cell {identity}")
+
+    visualization_stacks = []
 
     for _, row in frames_data.iterrows():
         f, l, semantic = (
@@ -524,11 +554,9 @@ def unaligned_chromatin(
         )
 
         if semantic == 1:
-            removal_mask = determine_removal_mask(
-                tophat_cell, cell, config
-            )
+            removal_mask = determine_removal_mask(tophat_cell, cell, config)
 
-            if removal_mask is None:
+            if removal_mask is None: #this happens only if no chromatin was found
                 print("Lost track of cell! Moving on to next cell")
                 return None
 
@@ -536,9 +564,27 @@ def unaligned_chromatin(
             if np.any(removal_mask):
                 successful_removal_frames.append(f)
 
-            area_sig, int_sig, num_sig, total_chromatin_area, total_chromatin_intensity = segment_unaligned_chromosomes(
+            measurements, labeled_chromosmes = segment_unaligned_chromosomes(
                 cell, tophat_cell, removal_mask, cell_mask, config
             )
+            (
+                area_sig,
+                int_sig,
+                num_sig,
+                total_chromatin_area,
+                total_chromatin_intensity,
+            ) = measurements
+
+
+            crop_stack = save_chromatin_crops(
+                                            cell, 
+                                            tophat_cell, 
+                                            cell_mask, 
+                                            labeled_chromosmes, 
+                                            removal_mask
+                                            )
+            visualization_stacks.append(crop_stack)
+
         else:
             area_sig, int_sig, num_sig = 0, 0, 0
             total_chromatin_area, total_chromatin_intensity = 0, 0.0
@@ -552,7 +598,7 @@ def unaligned_chromatin(
                 total_chromatin_area,
             )
         )
-
+    
     (
         area_signal,
         intensity_signal,
@@ -565,14 +611,16 @@ def unaligned_chromatin(
     num_removal_regions = 0
     first_removal_frame = -1
     last_removal_frame = -1
-    
+
     if successful_removal_frames:
         successful_removal_frames.sort()
         ranges = find_contiguous_ranges(successful_removal_frames)
         num_removal_regions = len(ranges)
         first_removal_frame = successful_removal_frames[0]
         last_removal_frame = successful_removal_frames[-1]
-        print(f"Cell {identity}: Metaphase plates were removed from time point {first_removal_frame} to {last_removal_frame} in {num_removal_regions} contigous regions")
+        print(
+            f"Cell {identity}: Metaphase plates were removed from time point {first_removal_frame} to {last_removal_frame} in {num_removal_regions} contigous regions"
+        )
     else:
         print(f"Cell {identity}: No metaphase plates were removed")
 
@@ -585,6 +633,7 @@ def unaligned_chromatin(
         num_removal_regions,
         first_removal_frame,
         last_removal_frame,
+        visualization_stacks
     )
 
 
@@ -619,95 +668,99 @@ def visualize_chromatin_processing(
     """
     if config is None:
         config = ChromatinSegConfig()
-    
+
     # Get cell data and filter for metaphase only
-    frames_data = analysis_df.query(f"particle == {identity} and semantic_smoothed == 1")
+    frames_data = analysis_df.query(
+        f"particle == {identity} and semantic_smoothed == 1"
+    )
     if len(frames_data) == 0:
         print(f"No mitotic timepoints found for cell {identity}")
         return
-    
+
     # Select evenly spaced metaphase timepoints
     total_metaphase_frames = len(frames_data)
     if n_rows > total_metaphase_frames:
         n_rows = total_metaphase_frames
-        print(f"Warning: Only {total_metaphase_frames} mitotic frames available, showing all frames")
-    
+        print(
+            f"Warning: Only {total_metaphase_frames} mitotic frames available, showing all frames"
+        )
+
     # Calculate frame indices to display
     if n_rows == total_metaphase_frames:
         frame_indices = list(range(total_metaphase_frames))
     else:
-        frame_indices = [int(i * (total_metaphase_frames - 1) / (n_rows - 1)) for i in range(n_rows)]
-    
+        frame_indices = [
+            int(i * (total_metaphase_frames - 1) / (n_rows - 1)) for i in range(n_rows)
+        ]
+
     # Create figure
     fig, axes = plt.subplots(n_rows, 5, figsize=figsize, dpi=dpi)
     if n_rows == 1:
         axes = axes.reshape(1, -1)
-        
+
     # Column titles
     col_titles = [
-        'Original Cell',
-        'Deconvolved',
-        'Top-hat Filtered',
-        'Metaphase Plate Mask',
-        'Unaligned Chromosomes'
+        "Original Cell",
+        "Deconvolved",
+        "Top-hat Filtered",
+        "Metaphase Plate Mask",
+        "Unaligned Chromosomes",
     ]
-    
+
     # Set column titles
     for col, title in enumerate(col_titles):
-        axes[0, col].set_title(title, fontsize=10, fontweight='bold')
-    
+        axes[0, col].set_title(title, fontsize=10, fontweight="bold")
+
     zoom_factor = adjust_zoom_factor(chromatin.shape, instance.shape)
-    
-    print('frame_indices', frame_indices)
+
+    print("frame_indices", frame_indices)
     for row, frame_idx in enumerate(frame_indices):
         row_data = frames_data.iloc[frame_idx]
         f, l = (
             int(row_data["frame"]),
             int(row_data["label"]),
         )
-        
+
         # Get processed images
         cell, tophat_cell, cell_mask, deconv_cell = compute_cell_images(
             instance, chromatin, f, l, zoom_factor, config
         )
-        
+
         # Column 1: Original cell
-        axes[row, 0].imshow(cell, cmap='gray')
-        axes[row, 0].set_ylabel(f'Frame {f}', fontsize=10, fontweight='bold')
+        axes[row, 0].imshow(cell, cmap="gray")
+        axes[row, 0].set_ylabel(f"Frame {f}", fontsize=10, fontweight="bold")
         axes[row, 0].set_xticks([])
         axes[row, 0].set_yticks([])
-        
+
         # Column 2: Deconvolved
-        axes[row, 1].imshow(deconv_cell, cmap='gray')
+        axes[row, 1].imshow(deconv_cell, cmap="gray")
         axes[row, 1].set_xticks([])
         axes[row, 1].set_yticks([])
-        
+
         # Column 3: Top-hat filtered
-        axes[row, 2].imshow(tophat_cell, cmap='gray')
+        axes[row, 2].imshow(tophat_cell, cmap="gray")
         axes[row, 2].set_xticks([])
         axes[row, 2].set_yticks([])
-        
+
         # Column 4: Metaphase plate mask
-        removal_mask = determine_removal_mask(
-            tophat_cell, cell, config
-        )
+        removal_mask = determine_removal_mask(tophat_cell, cell, config)
         if removal_mask is not None:
-            axes[row, 3].imshow(tophat_cell, cmap='gray')
-            
+            axes[row, 3].imshow(tophat_cell, cmap="gray")
+
             # Get the original region mask for comparison
             labeled_regions, max_lbl = get_largest_signal_regions(tophat_cell, cell)
             if max_lbl is not None:
                 region_mask = labeled_regions == max_lbl
-                
+
                 # Create colored overlays
                 # Blue for original region mask
                 colored_region = np.zeros((*region_mask.shape, 4))
                 colored_region[region_mask] = [0, 0, 1, 0.2]  # Blue with alpha
-                
+
                 # Red for hybrid rectangle (removal mask)
                 colored_removal = np.zeros((*removal_mask.shape, 4))
                 colored_removal[removal_mask] = [1, 0, 0, 0.2]  # Red with alpha
-                
+
                 # Overlay both
                 axes[row, 3].imshow(colored_region)
                 axes[row, 3].imshow(colored_removal)
@@ -717,12 +770,19 @@ def visualize_chromatin_processing(
                 colored_removal[removal_mask] = [1, 0, 0, 0.2]  # Red with alpha
                 axes[row, 3].imshow(colored_removal)
         else:
-            axes[row, 3].text(0.5, 0.5, 'No metaphase\nplate detected', 
-                            ha='center', va='center', transform=axes[row, 3].transAxes,
-                            fontsize=10, color='red')
+            axes[row, 3].text(
+                0.5,
+                0.5,
+                "No metaphase\nplate detected",
+                ha="center",
+                va="center",
+                transform=axes[row, 3].transAxes,
+                fontsize=10,
+                color="red",
+            )
         axes[row, 3].set_xticks([])
         axes[row, 3].set_yticks([])
-        
+
         # Column 5: Unaligned chromosomes
         if removal_mask is not None:
             labeled_chromosomes, _ = segment_mask_unaligned(
@@ -731,56 +791,69 @@ def visualize_chromatin_processing(
 
             # Create a colored overlay for different chromosome regions
             colored_chromosomes = np.zeros((*labeled_chromosomes.shape, 4))
-            
+
             # Define a color palette for different chromosomes
             colors = [
-                [1, 0, 0, 0.2],    # Red
-                [0, 1, 0, 0.2],    # Green
-                [0, 0, 1, 0.2],    # Blue
-                [1, 1, 0, 0.2],    # Yellow
-                [1, 0, 1, 0.2],    # Magenta
-                [0, 1, 1, 0.2],    # Cyan
+                [1, 0, 0, 0.2],  # Red
+                [0, 1, 0, 0.2],  # Green
+                [0, 0, 1, 0.2],  # Blue
+                [1, 1, 0, 0.2],  # Yellow
+                [1, 0, 1, 0.2],  # Magenta
+                [0, 1, 1, 0.2],  # Cyan
                 [1, 0.5, 0, 0.2],  # Orange
                 [0.5, 0, 1, 0.2],  # Purple
                 [0, 0.5, 0, 0.2],  # Dark Green
-                [0.5, 0.5, 0, 0.2], # Olive
+                [0.5, 0.5, 0, 0.2],  # Olive
             ]
-            
+
             unique_labels = np.unique(labeled_chromosomes[labeled_chromosomes > 0])
             for i, lbl in enumerate(unique_labels):
                 mask = labeled_chromosomes == lbl
-                color_idx = i % len(colors)  # Cycle through colors if more than 10 chromosomes
+                color_idx = i % len(
+                    colors
+                )  # Cycle through colors if more than 10 chromosomes
                 colored_chromosomes[mask] = colors[color_idx]
 
             colored_cellmask = np.zeros((*cell_mask.shape, 4))
             colored_cellmask[cell_mask] = [1, 1, 1, 0.2]  # White with alpha
-            
-            axes[row, 4].imshow(tophat_cell, cmap='gray')
+
+            axes[row, 4].imshow(tophat_cell, cmap="gray")
             axes[row, 4].imshow(colored_chromosomes)
             axes[row, 4].imshow(colored_cellmask)
             axes[row, 4].set_xticks([])
             axes[row, 4].set_yticks([])
 
         else:
-            axes[row, 4].text(0.5, 0.5, 'Cell lost\ntracking', 
-                            ha='center', va='center', transform=axes[row, 4].transAxes,
-                            fontsize=10, color='red')
+            axes[row, 4].text(
+                0.5,
+                0.5,
+                "Cell lost\ntracking",
+                ha="center",
+                va="center",
+                transform=axes[row, 4].transAxes,
+                fontsize=10,
+                color="red",
+            )
             axes[row, 4].set_xticks([])
             axes[row, 4].set_yticks([])
-    
+
     # Add overall title
-    fig.suptitle(f'Chromatin Processing Pipeline - Cell {identity})', fontsize=16, fontweight='bold')
-    
+    fig.suptitle(
+        f"Chromatin Processing Pipeline - Cell {identity})",
+        fontsize=16,
+        fontweight="bold",
+    )
+
     # Adjust layout
     plt.tight_layout()
-    
+
     # Save or display
     if save_path is not None:
-        plt.savefig(save_path, dpi=dpi, bbox_inches='tight')
+        plt.savefig(save_path, dpi=dpi, bbox_inches="tight")
         print(f"Plot saved to {save_path}")
     else:
         plt.show()
-    
+
     plt.close()
 
 
@@ -792,13 +865,13 @@ if __name__ == "__main__":
         for obj in os.scandir(root_dir)
         if "_inference" in obj.name and obj.is_dir()
     ]
-    
+
     # Find all available data files
     analysis_paths = []
     instance_paths = []
     chromatin_paths = []
     positions = []
-    
+
     for dir in inference_dirs:
         name_stub = re.search(
             r"[A-H]([1-9]|[0][1-9]|[1][0-2])_s(\d{2}|\d{1})", str(dir)
@@ -823,49 +896,58 @@ if __name__ == "__main__":
         print("Instance paths", len(instance_paths))
         print("Chromatin paths", len(chromatin_paths))
         exit(1)
-    
+
     # Example: visualize processing for a random cell in the first position
     if len(analysis_paths) > 0:
         # Load data for the first position
         analysis_df = pd.read_excel(analysis_paths[0])
         instance = tiff.imread(instance_paths[0])
         chromatin = tiff.imread(chromatin_paths[0])
-        
+
         # Clean the data
         analysis_df.replace([np.inf, -np.inf], np.nan, inplace=True)
         analysis_df.dropna(inplace=True)
-        
+
         # Get available cells
         available_cells = analysis_df["particle"].unique()
-        
+
         if len(available_cells) > 0:
             # Find cells with metaphase timepoints
             cells_with_metaphase = []
             for cell_id in available_cells:
-                metaphase_frames = analysis_df.query(f"particle == {cell_id} and semantic_smoothed == 1")
+                metaphase_frames = analysis_df.query(
+                    f"particle == {cell_id} and semantic_smoothed == 1"
+                )
                 if len(metaphase_frames) > 0:
                     cells_with_metaphase.append(cell_id)
-            
+
             if len(cells_with_metaphase) > 0:
                 # Randomly select a cell
                 cell_id = random.choice(cells_with_metaphase)
                 cell_id = 758
-                metaphase_frames = analysis_df.query(f"particle == {cell_id} and semantic_smoothed == 1")
-                
+                metaphase_frames = analysis_df.query(
+                    f"particle == {cell_id} and semantic_smoothed == 1"
+                )
+
                 print(f"Randomly selected cell {cell_id} from position {positions[0]}")
                 print(f"Found {len(metaphase_frames)} metaphase timepoints")
-                
+
                 # Create save path
                 save_dir = os.path.dirname(analysis_paths[0])
-                save_path = os.path.join(save_dir, f"{positions[0]}_cell_{cell_id}_processing.png")
-                
+                save_path = os.path.join(
+                    save_dir, f"{positions[0]}_cell_{cell_id}_processing.png"
+                )
+
                 # Run visualization
                 visualize_chromatin_processing(
-                    cell_id, analysis_df, instance, chromatin,
+                    cell_id,
+                    analysis_df,
+                    instance,
+                    chromatin,
                     n_rows=10,  # Show 10 metaphase timepoints
                     save_path=save_path,
                     figsize=(12, 16),
-                    dpi=150
+                    dpi=150,
                 )
             else:
                 print("No cells with metaphase timepoints found")
