@@ -5,8 +5,6 @@ from typing import Optional
 from skimage.restoration import denoise_tv_chambolle
 from changept import *
 import re
-from segment_chromatin import get_largest_signal_regions
-
 
 def smooth_cycb_chromatin(
     chromatin_df: pd.DataFrame,
