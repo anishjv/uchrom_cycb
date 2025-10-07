@@ -224,12 +224,12 @@ def cycb_chromatin_batch_analyze(
                 }
             )
 
-
             file_path = os.path.join(vis_dir, f'cell_{cell_id}.h5')
             with h5py.File(file_path, "w") as f:
                 for i, stack in enumerate(visualization_stacks):
-                    # Store each crop stack as a separate dataset
-                    f.create_dataset(f"{i}", data=stack)
+                    grp = f.create_group(f"cell_{i}")
+                    for j, img in enumerate(stack):                        
+                        grp.create_dataset(f'{j}', data=img, compression="gzip")
 
         print(f"Created long-format dataframe with {len(degradation_data)} rows")
         print(

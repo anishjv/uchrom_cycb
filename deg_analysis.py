@@ -1,10 +1,12 @@
 from cmath import phase
 import pandas as pd
 import numpy as np
-from typing import Optional
+from typing import Optional, List
 from skimage.restoration import denoise_tv_chambolle
 from changept import *
 import re
+import h5py
+from matplotlib.colors import to_rgba
 
 def smooth_cycb_chromatin(
     chromatin_df: pd.DataFrame,
@@ -269,64 +271,149 @@ def save_chromatin_crops(
     cell_mask: np.ndarray,
     labeled_chromosomes: np.ndarray,
     removal_mask: np.ndarray,
-) -> np.ndarray:
+) -> List[np.ndarray]:
     """
     Create a stack of chromatin crops for a single cell across metaphase timepoints.
     ------------------------------------------------------------------------------------------------------
     INPUTS:
-    cell: np.ndarray, raw grayscale crop of the cell
-    tophat_cell: np.ndarray, preprocessed cell image for metaphase plate visualization
-    cell_mask: np.ndarray, binary mask of the cell
-    labeled_chromosomes: np.ndarray, labeled chromosome regions
-    removal_mask: np.ndarray, mask for removed regions
+        cell: np.ndarray, raw grayscale crop of the cell
+        tophat_cell: np.ndarray, preprocessed cell image (unused as base; raw cell is used)
+        cell_mask: np.ndarray, binary mask of the cell
+        labeled_chromosomes: np.ndarray, labeled chromosome regions
+        removal_mask: np.ndarray, mask for removed regions
     OUTPUTS:
-    crop_stack: np.ndarray, shape (3, H, W, 3) containing:
-        [0] raw cell (converted to RGB)
-        [1] metaphase plate visualization
-        [2] colored overlay of unaligned chromosomes + cell mask
+        crop_stack: list of np.ndarray containing:
+            [0] raw cell (grayscale)
+            [1] metaphase plate overlay (RGBA)
+            [2] colored overlay of unaligned chromosomes + cell mask (RGBA)
     """
 
-    # --- Convert grayscale raw cell to RGB ---
-    cell_rgb = np.stack([cell]*3, axis=-1)  # shape: (H, W, 3)
-
-    # --- Create metaphase plate visualization ---
     from segment_chromatin import get_largest_signal_regions
+    H, W = cell.shape
+    raw_img = cell.copy()  # raw grayscale base
+
+    # --- Helper function for blending ---
+    def blend_overlay(base_rgba, overlay_rgba):
+        """Alpha blend overlay_rgba onto base_rgba."""
+        alpha = overlay_rgba[..., 3:4]
+        base_rgba[..., :3] = (1 - alpha) * base_rgba[..., :3] + alpha * overlay_rgba[..., :3]
+        base_rgba[..., 3] = np.clip(base_rgba[..., 3] + alpha[..., 0], 0, 1)
+        return base_rgba
+
+    # --- Metaphase overlay ---
     labeled_regions, max_lbl = get_largest_signal_regions(tophat_cell, cell)
-    region_mask = labeled_regions == max_lbl
+    if max_lbl is not None:
+        metaphase_mask = labeled_regions == max_lbl
+    metaphase_overlay = np.zeros((H, W, 4), dtype=float)
+    if metaphase_mask is not None:
+        mask_rgba = np.zeros((H, W, 4), dtype=float)
+        mask_rgba[metaphase_mask.astype(bool)] = [0, 0, 1, 0.2]  # blue alpha 0.2
+        metaphase_overlay = blend_overlay(metaphase_overlay, mask_rgba)
+    if removal_mask is not None:
+        removal_rgba = np.zeros((H, W, 4), dtype=float)
+        removal_rgba[removal_mask.astype(bool)] = [1, 0, 0, 0.2]  # red alpha 0.2
+        metaphase_overlay = blend_overlay(metaphase_overlay, removal_rgba)
 
-    metaphase_plate_crop = np.stack([tophat_cell]*3, axis=-1)
-    metaphase_plate_crop[region_mask, 2] = 255    # Blue overlay for region
-    metaphase_plate_crop[removal_mask, 0] = 255   # Red overlay for removal
-
-    # --- Create colored overlay for unaligned chromosomes ---
-    unaligned_chromosomes_crop = np.zeros((*labeled_chromosomes.shape, 3), dtype=np.uint8)
+    # --- Unaligned chromosomes overlay ---
+    unaligned_overlay = np.zeros((H, W, 4), dtype=float)
     colors = [
-        [255, 0, 0],    # Red
-        [0, 255, 0],    # Green
-        [0, 0, 255],    # Blue
-        [255, 255, 0],  # Yellow
-        [255, 0, 255],  # Magenta
-        [0, 255, 255],  # Cyan
-        [255, 128, 0],  # Orange
-        [128, 0, 255],  # Purple
-        [0, 128, 0],    # Dark Green
-        [128, 128, 0],  # Olive
+        [1, 0, 0, 0.2], [0, 1, 0, 0.2], [0, 0, 1, 0.2], [1, 1, 0, 0.2],
+        [1, 0, 1, 0.2], [0, 1, 1, 0.2], [1, 0.5, 0, 0.2], [0.5, 0, 1, 0.2],
+        [0, 0.5, 0, 0.2], [0.5, 0.5, 0, 0.2]
     ]
 
     unique_labels = np.unique(labeled_chromosomes[labeled_chromosomes > 0])
     for i, lbl in enumerate(unique_labels):
         mask = labeled_chromosomes == lbl
-        color_idx = i % len(colors)
-        unaligned_chromosomes_crop[mask] = colors[color_idx]
+        chrom_rgba = np.zeros((H, W, 4), dtype=float)
+        chrom_rgba[mask] = colors[i % len(colors)]
+        unaligned_overlay = blend_overlay(unaligned_overlay, chrom_rgba)
 
-    # Overlay the cell mask in white
-    unaligned_chromosomes_crop[cell_mask] = [255, 255, 255]
+    # Overlay faint white cell outline last
+    cell_rgba = np.zeros((H, W, 4), dtype=float)
+    cell_rgba[cell_mask.astype(bool)] = [1, 1, 1, 0.1]
+    unaligned_overlay = blend_overlay(unaligned_overlay, cell_rgba)
 
-    # --- Stack all three crops ---
-    crop_stack = np.stack([
-        cell_rgb,
-        metaphase_plate_crop,
-        unaligned_chromosomes_crop
-    ], axis=0)  # shape: (3, H, W, 3)
+    return [raw_img, metaphase_overlay, unaligned_overlay]
 
-    return crop_stack
+
+def visualize_chromatin_hd5(file_path: str, max_cells: Optional[int] = 10):
+    """
+    Open an HDF5 file containing chromatin crop stacks and visualize them.
+    ----------------------------------------------------------------------
+    INPUTS:
+        file_path : str, Path to the HDF5 file.
+        max_cells : int, optional
+    """
+    
+    with h5py.File(file_path, "r") as f:
+        cell_groups = list(f.keys())
+        n_cells = min(len(cell_groups), max_cells)
+        print(f"Found {len(cell_groups)} crop stacks, displaying {n_cells}.")
+
+        # --- Infer target shape ---
+        heights, widths = [], []
+        for col in range(n_cells):
+            grp = f[cell_groups[col]]
+            raw_img = grp['0'][()]
+            heights.append(raw_img.shape[0])
+            widths.append(raw_img.shape[1])
+        target_shape = (max(heights), max(widths))
+
+        fig, axes = plt.subplots(3, n_cells, figsize=(3*n_cells, 9), squeeze=False)
+
+        for col in range(n_cells):
+            grp = f[cell_groups[col]]
+            raw_img = grp['0'][()].astype(float)/255   # dataset 0
+            metaphase_overlay = grp['1'][()]
+            unaligned_overlay = grp['2'][()]
+
+            # --- Pad images to target_shape ---
+            def pad_to_shape(img, target_shape, value=0):
+                H, W = img.shape[:2]
+                pad_h = target_shape[0] - H
+                pad_w = target_shape[1] - W
+                pad_top = pad_h // 2
+                pad_bottom = pad_h - pad_top
+                pad_left = pad_w // 2
+                pad_right = pad_w - pad_left
+                if img.ndim == 2:  # grayscale
+                    return np.pad(img, ((pad_top, pad_bottom), (pad_left, pad_right)), constant_values=value)
+                else:  # RGBA
+                    return np.pad(img, ((pad_top, pad_bottom), (pad_left, pad_right), (0,0)), constant_values=value)
+
+            raw_img = pad_to_shape(raw_img, target_shape, value=0)
+            metaphase_overlay = pad_to_shape(metaphase_overlay, target_shape, value=0)
+            unaligned_overlay = pad_to_shape(unaligned_overlay, target_shape, value=0)
+
+            # --- Scale overlay RGB to darken ---
+            metaphase_overlay_disp = metaphase_overlay.copy()
+            metaphase_overlay_disp[..., :3] *= 3
+            unaligned_overlay_disp = unaligned_overlay.copy()
+            unaligned_overlay_disp[..., :3] *= 3
+
+            # Row 0: raw grayscale
+            axes[0, col].imshow(raw_img, cmap="gray")
+            axes[0, col].axis("off")
+
+
+            # Row 2: metaphase overlay over raw
+            axes[1, col].imshow(raw_img, cmap="gray")
+            axes[1, col].imshow(metaphase_overlay_disp)
+            axes[1, col].axis("off")
+
+
+            # Row 1: unaligned overlay over raw
+            axes[2, col].imshow(raw_img, cmap="gray")
+            axes[2, col].imshow(unaligned_overlay_disp)
+            axes[2, col].axis("off")
+
+        # Row labels
+        row_labels = ["Raw", "Unaligned Chromosomes"]
+        for i, label in enumerate(row_labels):
+            axes[i, 0].set_ylabel(label, fontsize=8, rotation=0, labelpad=40, va="center")
+
+        plt.tight_layout()
+        plt.show()
+
+        return fig
