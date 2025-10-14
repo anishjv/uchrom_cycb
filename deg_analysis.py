@@ -8,6 +8,7 @@ import re
 import h5py
 from matplotlib.colors import to_rgba
 
+
 def smooth_cycb_chromatin(
     chromatin_df: pd.DataFrame,
     weight: Optional[int] = 12,
@@ -35,6 +36,7 @@ def smooth_cycb_chromatin(
     semantic_traces = []
     id_traces = []
     frame_traces = []
+    uchrom_nums = []
 
     for id in chromatin_df["cell_id"].unique():
         trace = chromatin_df.query(f"cell_id=={id}")["cycb_intensity"].to_numpy()
@@ -44,6 +46,7 @@ def smooth_cycb_chromatin(
         semantic = chromatin_df.query(f"cell_id=={id}")["semantic"].to_numpy()
         frames = chromatin_df.query(f'cell_id=={id}')["frame"].to_numpy()
         ids = chromatin_df.query(f'cell_id=={id}')["cell_id"].to_numpy()
+        uchrom_num = chromatin_df.query(f'cell_id=={id}')['num_u_chromosomes'].to_numpy()
 
         smooth_trace = denoise_tv_chambolle(trace, weight=weight)
         first_deriv = np.gradient(smooth_trace)
@@ -56,6 +59,7 @@ def smooth_cycb_chromatin(
         semantic_traces.append(semantic)
         id_traces.append(ids)
         frame_traces.append(frames)
+        uchrom_nums.append(uchrom_num)
 
     return (
         traces,
@@ -65,7 +69,8 @@ def smooth_cycb_chromatin(
         achromatin_traces,
         semantic_traces,
         id_traces,
-        frame_traces
+        frame_traces,
+        uchrom_nums
     )
 
 
@@ -78,6 +83,7 @@ def unpack_cycb_chromatin(
     changepts: list,
     id_traces: list,
     frame_traces: list,
+    uchrom_nums: list,
     remove_end_mitosis: Optional[bool] = True,
 ):
     """
@@ -92,6 +98,7 @@ def unpack_cycb_chromatin(
         changepts: list, detected changepoint indices per cell (np.nan if unavailable)
         id_traces: list, cell ID traces per cell
         frame_traces: list, frame number traces per cell
+        uchrom_nums: list, number of unaligned chromosomes (estimate) per cell
         remove_end_mitosis: Optional[bool], skip cells ending the movie in mitosis when True
     OUTPUTS:
         unpacked_smooth_cycb: list[float], per-timepoint Cyclin B values within mitosis window
@@ -103,6 +110,7 @@ def unpack_cycb_chromatin(
         min_after_changept: list[float], minutes relative to changepoint (scaled as 4*(t - cp))
         unpacked_tracking_ids: list[int], per-timepoint cell IDs within mitosis window
         unpacked_frames: list[int], per-timepoint frame numbers within mitosis window
+        unpacked_uchrom_nums: list[int], per-timepoint number of unaligned chromosomes
     """
 
     unpacked_smooth_cycb = []
@@ -114,6 +122,7 @@ def unpack_cycb_chromatin(
     min_after_changept = []
     unpacked_tracking_ids = []
     unpacked_frames = []
+    unpacked_uchrom_nums = []
 
     nan_registry = np.isnan(changepts)
     for j, cell_trace in enumerate(traces):
@@ -124,6 +133,7 @@ def unpack_cycb_chromatin(
         achromatin = achromatin_traces[j]
         tracking_ids = id_traces[j]
         frames = frame_traces[j]
+        uchrom_n = uchrom_nums[j]
 
         # if changepoint detection failed ignore cell
         if nan_registry[j]:
@@ -156,6 +166,7 @@ def unpack_cycb_chromatin(
                 phase_flag.append(flag)
                 unpacked_tracking_ids.append(tracking_ids[t])
                 unpacked_frames.append(frames[t])
+                unpacked_uchrom_nums.append(uchrom_n[t])
 
             else:
                 pass
@@ -170,6 +181,7 @@ def unpack_cycb_chromatin(
         min_after_changept,
         unpacked_tracking_ids,
         unpacked_frames,
+        unpacked_uchrom_nums
     )
 
 
@@ -187,6 +199,7 @@ def create_aggregate_df(paths: list[str], remove_end_mitosis: Optional[bool] = T
     usc_cont = []
     udd_cont = []
     uca_cont = []
+    ucn_cont = []
     aca_cont = []
     upm_cont = []
     date_well_cont = []
@@ -198,7 +211,7 @@ def create_aggregate_df(paths: list[str], remove_end_mitosis: Optional[bool] = T
 
     for path in paths:
         chromatin_df = pd.read_excel(path)
-        _, smooth_traces, derivatives, uchromatin, achromatin, semantics, id_traces, frame_traces = (
+        _, smooth_traces, derivatives, uchromatin, achromatin, semantics, id_traces, frame_traces, uchrom_nums = (
             smooth_cycb_chromatin(chromatin_df, weight=5)
         )
         changepts = [
@@ -216,6 +229,7 @@ def create_aggregate_df(paths: list[str], remove_end_mitosis: Optional[bool] = T
             min_after_changept,
             unpacked_tracking_ids,
             unpacked_frames,
+            unpacked_uchrom_num,
         ) = unpack_cycb_chromatin(
             smooth_traces,
             derivatives,
@@ -225,11 +239,13 @@ def create_aggregate_df(paths: list[str], remove_end_mitosis: Optional[bool] = T
             changepts,
             id_traces,
             frame_traces,
+            uchrom_nums,
             remove_end_mitosis,
         )
         usc_cont += unpacked_smooth_cycb
         udd_cont += unpacked_dcycb_dt
         uca_cont += unpacked_chromatin_area
+        ucn_cont += unpacked_uchrom_num
         aca_cont += unpacked_achromatin_area
         upm_cont += unpacked_pos_in_mitosis
         pf_cont += phase_flag
@@ -252,6 +268,7 @@ def create_aggregate_df(paths: list[str], remove_end_mitosis: Optional[bool] = T
             "cycb": usc_cont,
             "deg_rate": udd_cont,
             "uchromatin": uca_cont,
+            "uchromatin_num": ucn_cont, 
             "achromatin": aca_cont,
             "pos_in_mitosis": upm_cont,
             "phase_flag": pf_cont,
@@ -292,7 +309,7 @@ def save_chromatin_crops(
     H, W = cell.shape
     raw_img = cell.copy()  # raw grayscale base
 
-    # --- Helper function for blending ---
+    # Helper function for blending 
     def blend_overlay(base_rgba, overlay_rgba):
         """Alpha blend overlay_rgba onto base_rgba."""
         alpha = overlay_rgba[..., 3:4]
@@ -300,7 +317,7 @@ def save_chromatin_crops(
         base_rgba[..., 3] = np.clip(base_rgba[..., 3] + alpha[..., 0], 0, 1)
         return base_rgba
 
-    # --- Metaphase overlay ---
+    #  Metaphase overlay 
     labeled_regions, max_lbl = get_largest_signal_regions(tophat_cell, cell)
     if max_lbl is not None:
         metaphase_mask = labeled_regions == max_lbl
@@ -314,7 +331,7 @@ def save_chromatin_crops(
         removal_rgba[removal_mask.astype(bool)] = [1, 0, 0, 0.2]  # red alpha 0.2
         metaphase_overlay = blend_overlay(metaphase_overlay, removal_rgba)
 
-    # --- Unaligned chromosomes overlay ---
+    #  Unaligned chromosomes overlay
     unaligned_overlay = np.zeros((H, W, 4), dtype=float)
     colors = [
         [1, 0, 0, 0.2], [0, 1, 0, 0.2], [0, 0, 1, 0.2], [1, 1, 0, 0.2],
@@ -337,7 +354,11 @@ def save_chromatin_crops(
     return [raw_img, metaphase_overlay, unaligned_overlay]
 
 
-def visualize_chromatin_hd5(file_path: str, max_cells: Optional[int] = 10):
+def visualize_chromatin_hd5(
+    file_path: str, 
+    trgt_indx: Optional[tuple] = None,
+    num_measured: Optional[int] = None, 
+    max_cells: Optional[int] = 20):
     """
     Open an HDF5 file containing chromatin crop stacks and visualize them.
     ----------------------------------------------------------------------
@@ -347,18 +368,26 @@ def visualize_chromatin_hd5(file_path: str, max_cells: Optional[int] = 10):
     """
     
     with h5py.File(file_path, "r") as f:
-        cell_groups = list(f.keys())
-        n_cells = min(len(cell_groups), max_cells)
-        print(f"Found {len(cell_groups)} crop stacks, displaying {n_cells}.")
+        cell_groups = sorted(f.keys(), key=lambda x: int(x.split('_')[-1]))
+        num_images = len(cell_groups)
 
-        # --- Infer target shape ---
+        if num_measured:
+            t_start = num_images - num_measured
+            print(f'Saved stacks contain {num_images} each; however, only {num_measured} were measured. Adjusting target indices accordingly')
+            trgt_indx = (trgt_indx[0] + t_start, trgt_indx[1] + t_start)
+        else:
+            pass
+        
+        cell_groups = cell_groups[trgt_indx[0]:trgt_indx[1]] if trgt_indx else cell_groups[-max_cells:]
+        n_cells = min(len(cell_groups), max_cells)
+
+        # infer target shape (smallest height/width)
         heights, widths = [], []
         for col in range(n_cells):
             grp = f[cell_groups[col]]
             raw_img = grp['0'][()]
             heights.append(raw_img.shape[0])
             widths.append(raw_img.shape[1])
-        target_shape = (max(heights), max(widths))
 
         fig, axes = plt.subplots(3, n_cells, figsize=(3*n_cells, 9), squeeze=False)
 
@@ -368,50 +397,23 @@ def visualize_chromatin_hd5(file_path: str, max_cells: Optional[int] = 10):
             metaphase_overlay = grp['1'][()]
             unaligned_overlay = grp['2'][()]
 
-            # --- Pad images to target_shape ---
-            def pad_to_shape(img, target_shape, value=0):
-                H, W = img.shape[:2]
-                pad_h = target_shape[0] - H
-                pad_w = target_shape[1] - W
-                pad_top = pad_h // 2
-                pad_bottom = pad_h - pad_top
-                pad_left = pad_w // 2
-                pad_right = pad_w - pad_left
-                if img.ndim == 2:  # grayscale
-                    return np.pad(img, ((pad_top, pad_bottom), (pad_left, pad_right)), constant_values=value)
-                else:  # RGBA
-                    return np.pad(img, ((pad_top, pad_bottom), (pad_left, pad_right), (0,0)), constant_values=value)
-
-            raw_img = pad_to_shape(raw_img, target_shape, value=0)
-            metaphase_overlay = pad_to_shape(metaphase_overlay, target_shape, value=0)
-            unaligned_overlay = pad_to_shape(unaligned_overlay, target_shape, value=0)
-
-            # --- Scale overlay RGB to darken ---
+            # Scale overlay RGB to darken
             metaphase_overlay_disp = metaphase_overlay.copy()
             metaphase_overlay_disp[..., :3] *= 3
             unaligned_overlay_disp = unaligned_overlay.copy()
             unaligned_overlay_disp[..., :3] *= 3
 
-            # Row 0: raw grayscale
+            # Display
             axes[0, col].imshow(raw_img, cmap="gray")
             axes[0, col].axis("off")
 
-
-            # Row 2: metaphase overlay over raw
             axes[1, col].imshow(raw_img, cmap="gray")
             axes[1, col].imshow(metaphase_overlay_disp)
             axes[1, col].axis("off")
 
-
-            # Row 1: unaligned overlay over raw
             axes[2, col].imshow(raw_img, cmap="gray")
             axes[2, col].imshow(unaligned_overlay_disp)
             axes[2, col].axis("off")
-
-        # Row labels
-        row_labels = ["Raw", "Unaligned Chromosomes"]
-        for i, label in enumerate(row_labels):
-            axes[i, 0].set_ylabel(label, fontsize=8, rotation=0, labelpad=40, va="center")
 
         plt.tight_layout()
         plt.show()
