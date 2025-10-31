@@ -933,6 +933,8 @@ if __name__ == "__main__":
                     save_dir, f"{positions[0]}_cell_{cell_id}_processing.png"
                 )
 
+                config = ChromatinSegConfig() #this may be edited
+
                 # Run visualization
                 visualize_chromatin_processing(
                     cell_id,
@@ -940,6 +942,7 @@ if __name__ == "__main__":
                     instance,
                     chromatin,
                     n_rows=10,  # Show 10 metaphase timepoints
+                    config = config,
                     save_path=save_path,
                     figsize=(12, 16),
                     dpi=150,
