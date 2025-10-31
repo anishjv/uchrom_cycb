@@ -24,7 +24,6 @@ import tifffile as tiff
 import random
 from PIL import Image
 from deg_analysis import save_chromatin_crops
-import h5py
 
 
 @dataclass
@@ -35,11 +34,8 @@ class ChromatinSegConfig:
     psf_size: int = 19
     gaussian_sigma: float = 0
     min_chromatin_area: int = 20
-    eccentricity_threshold: float = 0.8
-    euler_threshold: float = (
-        -2
-    )  # can be no more than three holes in the metaphase plate
-    metaphase_dilation_size: int = 5
+    eccentricity_threshold: float = 0.7 #largest region must have eccentricty greater than threshold to be considered for metaphase plate detection
+    euler_threshold: float = -2 # can be no more than three holes in the metaphase plate
 
 
 def airy_disk_psf(NA, wavelength_nm, pixel_size_um, psf_size=51, oversample=1):
@@ -859,7 +855,7 @@ def visualize_chromatin_processing(
 
 if __name__ == "__main__":
 
-    root_dir = Path("/Users/whoisv/Desktop/")
+    root_dir = Path("/Users/whoisv/Desktop/metphs_example/") #path to folder containing cell_app inference directory and chromatin image
     inference_dirs = [
         obj.path
         for obj in os.scandir(root_dir)
@@ -924,7 +920,6 @@ if __name__ == "__main__":
             if len(cells_with_metaphase) > 0:
                 # Randomly select a cell
                 cell_id = random.choice(cells_with_metaphase)
-                cell_id = 758
                 metaphase_frames = analysis_df.query(
                     f"particle == {cell_id} and semantic_smoothed == 1"
                 )

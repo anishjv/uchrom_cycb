@@ -154,9 +154,16 @@ def unpack_cycb_chromatin(
         t_min = min(mitotic_indices)
         t_max = max(mitotic_indices)
 
+        
         for t, val in enumerate(cell_trace):
-            if low_bound < t and t_max >= t:
-                flag = "slow" if t <= changept else "fast"
+            if t_min <= t <= t_max:
+                if t <= low_bound:
+                    flag = 'no-deg'
+                elif low_bound < t < changept:
+                    flag = 'slow'
+                else:
+                    flag = 'fast'
+
                 min_after_changept.append(4 * (t - changept))
                 unpacked_smooth_cycb.append(val)
                 unpacked_dcycb_dt.append(deg_rate[t])
@@ -356,7 +363,6 @@ def save_chromatin_crops(
 
 def visualize_chromatin_hd5(
     file_path: str, 
-    trgt_indx: Optional[tuple] = None,
     num_measured: Optional[int] = None, 
     max_cells: Optional[int] = 20):
     """
@@ -372,13 +378,11 @@ def visualize_chromatin_hd5(
         num_images = len(cell_groups)
 
         if num_measured:
-            t_start = num_images - num_measured
-            print(f'Saved stacks contain {num_images} each; however, only {num_measured} were measured. Adjusting target indices accordingly')
-            trgt_indx = (trgt_indx[0] + t_start, trgt_indx[1] + t_start)
+            cell_groups = cell_groups[-num_measured:]
+            print(f'Saved stacks contain {num_images} each; however, only {num_measured} were measured. Adjusting indices accordingly')
         else:
+            cell_groups = cell_groups[-max_cells:]
             pass
-        
-        cell_groups = cell_groups[trgt_indx[0]:trgt_indx[1]] if trgt_indx else cell_groups[-max_cells:]
         n_cells = min(len(cell_groups), max_cells)
 
         # infer target shape (smallest height/width)
