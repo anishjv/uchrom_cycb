@@ -289,7 +289,7 @@ def cycb_chromatin_batch_analyze(
 
 if __name__ == "__main__":
 
-    root_dir = Path("/Users/whoisv/Desktop/")
+    root_dir = Path("/nfs/turbo/umms-ajitj/anishjv/cyclinb_analysis/20250621-cycb-noc/")
     inference_dirs = [
         obj.path
         for obj in os.scandir(root_dir)
@@ -303,7 +303,7 @@ if __name__ == "__main__":
         name_stub = re.search(
             r"[A-H]([1-9]|[0][1-9]|[1][0-2])_s(\d{2}|\d{1})", str(dir)
         ).group()
-        name_stub = str(name_stub) + "_"
+        name_stub = str(name_stub) + '_'
         an_paths = glob.glob(f"{dir}/*analysis.xlsx")
         inst_paths = glob.glob(f"{dir}/*instance_movie.tif")
         chrom_paths = [
@@ -324,14 +324,11 @@ if __name__ == "__main__":
         print("Instance paths", len(instance_paths))
         print("Chromatin paths", len(chromatin_paths))
         sys.exit(1)
-
+    
     # Use default configuration
     cycb_chromatin_batch_analyze(
-        positions,
-        analysis_paths,
-        instance_paths,
-        chromatin_paths,
-        frame_interval_minutes=4.0,
+        positions, analysis_paths, instance_paths, chromatin_paths,
+        frame_interval_minutes=4.0
     )
 
     """

@@ -343,9 +343,18 @@ def process_movie(
     diagnostic_container # Dictionary to append lists for QC plots
 ):
     """
-    1. Loads stacks.
-    2. Calculates offset for ALL frames -> Updates Excel.
-    3. Extracts profile for FRAME 0 -> Appends to diagnostic_container.
+    Loads a single movie, calculates offsets for every frame, updates the analysis Excel file,
+    and extracts diagnostic data from the first frame.
+    ---------------------------------------------------------------------------------------------
+    INPUTS:
+        gfp_path: str, Path to the GFP movie TIFF file.
+        seg_path: str, Path to the segmentation movie TIFF file.
+        xlsx_path: str, Path to the analysis results Excel file.
+        bkg_map_stack: np.ndarray, 3D stack of background maps (Time, Y, X).
+        intensity_map: np.ndarray, 2D intensity correction map.
+        diagnostic_container: dict, Shared dictionary to store plotting data from Frame 0.
+    OUTPUTS:
+        None (Modifies the Excel file in place and updates diagnostic_container).
     """
     
     # Metadata
