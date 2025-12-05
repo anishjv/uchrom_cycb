@@ -337,107 +337,136 @@ def plot_background_panels(
     plt.tight_layout()
     return fig
 
-if __name__ == "__main__":
+def process_movie(
+    gfp_path, seg_path, xlsx_path, 
+    bkg_map_stack, intensity_map,
+    diagnostic_container # Dictionary to append lists for QC plots
+):
+    """
+    1. Loads stacks.
+    2. Calculates offset for ALL frames -> Updates Excel.
+    3. Extracts profile for FRAME 0 -> Appends to diagnostic_container.
+    """
+    
+    # Metadata
+    well_pos = re.search(r"[A-H]([1-9]|[0][1-9]|[1][0-2])_s(\d{2}|\d{1})", str(gfp_path)).group()
+    date = re.search(r"20\d{2}(0[1-9]|1[0-2])(0[1-9]|[12][0-9]|3[01])", str(gfp_path)).group()
+    well = well_pos.split('_')[0]
+    pos = well_pos.split('_')[1]
+    date_well = f"{date}-{well}"
+    
+    print(f"  Processing: {date_well} {pos}...")
 
-    root_dir = Path("/Volumes/umms-ajitj/anishjv/cyclinb_analysis/20250621-cycb-noc")
-    gfp_dir = Path("/Volumes/SharedHITSX/cdb-Joglekar-Lab-GL/Anish_Virdi/CycB_dynamics/ixn/20250621-cycb-noc/cycb/2025-06-21/20452") #sometimes the fluorescence images are in a different directory
-    inference_dirs = [
-        obj.path
-        for obj in os.scandir(root_dir)
-        if "_inference" in obj.name and obj.is_dir()
-    ]
+    # Load Images
+    gfp_stack = tif.imread(gfp_path)
+    seg_stack = tif.imread(seg_path)
+    n_frames = gfp_stack.shape[0]
 
-    file_pairs = [] # list of (gfp_path, seg_path) tuples
-    for dir_path in inference_dirs:
-        name_stub_match = re.search(
-            r"[A-H]([1-9]|[0][1-9]|[1][0-2])_s(\d{2}|\d{1})", str(dir_path)
-        )
-        if not name_stub_match:
-            print(f"Skipping inference directory with unusual name: {dir_path}")
-            continue
+    frame_offsets = {} 
+    for t in range(n_frames):
 
-        name_stub = name_stub_match.group()
-        name_stub_prefix = str(name_stub) + "_"
+        img = gfp_stack[t]
+        seg = seg_stack[t] if len(seg_stack) > t else seg_stack[-1]
+        current_bkg = bkg_map_stack[t] if t < bkg_map_stack.shape[0] else bkg_map_stack[-1]
+
+
+        if seg.shape != img.shape:
+            seg = resize(seg, img.shape, order=0, preserve_range=True, anti_aliasing=False).astype(seg.dtype)
         
-        seg_path_list = glob.glob(f"{dir_path}/*semantic_movie.tif")
-        gfp_path_list = [
-            path
-            for path in glob.glob(f"{gfp_dir}/*GFP.tif")
-            if str(name_stub_prefix) in path
-        ]
-
-
-        if len(seg_path_list) == 1 and len(gfp_path_list) == 1:
-            file_pairs.append((gfp_path_list[0], seg_path_list[0]))
+        # Correction
+        corr_img = (img.astype(float) - current_bkg) / intensity_map
+        intensities, indices, is_valid, _ = measure_diagonal_network_path(corr_img, seg)
+        
+        # --- A. Offset Calculation (For Excel) ---
+        valid_pixels = intensities[is_valid]
+        if len(valid_pixels) > 0:
+            print(f'Offest sampled from {len(valid_pixels)} pixel values')
+            offset_val = np.mean(valid_pixels)
         else:
-            print(f"Warning: Could not find 1:1 match for {name_stub}. Found {len(gfp_path_list)} GFP files and {len(seg_path_list)} SEG files. Skipping.")
+            print(f'{len(valid_pixels)} valid pixels found; setting offset to np.nan')
+            offset_val = np.nan
+        frame_offsets[t] = offset_val
+        
+        if t == 0:
+            num_points = len(intensities)
+            diagnostic_container['date_wells'].extend([date_well] * num_points)
+            diagnostic_container['pos'].extend([pos] * num_points)
+            diagnostic_container['intensities'].extend(intensities - offset_val)
+            diagnostic_container['indices'].extend(indices)
+            diagnostic_container['validity'].extend(is_valid)
 
-    # Intensity Map
-    intensity_map_files = glob.glob(f"{root_dir}/*intensity_map.tif")
-    if not intensity_map_files:
-        print(f"ERROR: No 'intensity_map.tif' found in {root_dir}. Quitting.")
+    df = pd.read_excel(xlsx_path, engine='openpyxl')
+    if 'frame' in df.columns:
+        df['offset'] = df['frame'].map(frame_offsets)
+        df.to_excel(xlsx_path, index=False, engine='openpyxl')
+
+
+def main():
+    # --- Config ---
+    root_dir_path = "/nfs/turbo/umms-ajitj/anishjv/cyclinb_analysis/20251028-cycb-gsk"
+    gfp_dir_path = "/nfs/turbo/umms-ajitj/anishjv/cyclinb_analysis/20251028-cycb-gsk"
+    
+
+    print("Loading Maps...")
+    try:
+        intensity_map = tif.imread(glob.glob(f"{root_dir_path}/*intensity_map.tif")[0])
+        if intensity_map.ndim == 3: intensity_map = intensity_map[0]
+        bkg_map_stack = tif.imread(glob.glob(f"{root_dir_path}/*background_map.tif")[0])
+    except IndexError:
+        print("CRITICAL: Maps not found.")
         sys.exit(1)
-    intensity_map_f = intensity_map_files[0]
-    intensity_map = tif.imread(intensity_map_f, key=0)
 
-    # Background Map (corrected typo from user input)
-    bkg_map_files = glob.glob(f"{root_dir}/*background_map.tif") 
-    if not bkg_map_files:
-        print(f"ERROR: No 'background_map.tif' found in {root_dir}. Quitting.")
-        sys.exit(1)
-    bkg_map_f = bkg_map_files[0]
-    bkg_map = tif.imread(bkg_map_f, key=0)
+    root_dir = Path(root_dir_path)
+    inference_dirs = [obj.path for obj in os.scandir(root_dir) if "_inference" in obj.name and obj.is_dir()]
+    
+    # Container for plotting data
+    qc_data = {
+        'date_wells': [], 'pos': [], 'intensities': [], 'indices': [], 'validity': []
+    }
 
-    all_date_wells = []
-    all_pos = []
-    all_intensities = []
-    all_indices = []
-    all_validity = []
+    print(f"Found {len(inference_dirs)} inference directories.")
 
-    # 2. Iterate through the file pairs
-    for gfile, sfile in file_pairs:
+    for dir_path in inference_dirs:
+        name_stub_match = re.search(r"[A-H]([1-9]|[0][1-9]|[1][0-2])_s(\d{2}|\d{1})", str(dir_path))
+        if not name_stub_match: continue
+        name_stub = name_stub_match.group()
         
-        well_pos = re.search(r"[A-H]([1-9]|[0][1-9]|[1][0-2])_s(\d{2}|\d{1})", str(gfile)).group()
-        date = re.search(r"20\d{2}(0[1-9]|1[0-2])(0[1-9]|[12][0-9]|3[01])", str(gfile)).group()
-        well = well_pos.split('_')[0]
-        pos = well_pos.split('_')[1]
-        date_well = date + '-' + well
-        
-        print(f"Processing: {date} - {well_pos}")
+        seg_files = glob.glob(f"{dir_path}/*semantic_movie.tif")
+        xlsx_files = glob.glob(f"{dir_path}/*analysis.xlsx")
+        name_stub_prefix = str(name_stub) + "_"
+        gfp_files = [p for p in glob.glob(f"{gfp_dir_path}/*GFP.tif") if str(name_stub_prefix) in p]
 
-        gfp = tif.imread(gfile, key=0)
-        seg = tif.imread(sfile, key=0)
-        if seg.shape != gfp.shape:
-            seg = resize(
-                seg, 
-                gfp.shape, 
-                order=0, 
-                preserve_range=True, 
-                anti_aliasing=False
-            ).astype(seg.dtype)
+        if len(seg_files) == 1 and len(gfp_files) == 1 and len(xlsx_files) == 1:
+            process_movie(
+                gfp_files[0], seg_files[0], xlsx_files[0],
+                bkg_map_stack, intensity_map, qc_data
+            )
+        else:
+            print(f"Skipping {name_stub}: Files incomplete.")
 
-        corr_gfp = (gfp.astype(float) - bkg_map) / intensity_map
-        intensities, indices, validity, _ = measure_diagonal_network_path(corr_gfp, seg)
-        num_points = len(intensities)
-        
-        all_date_wells.extend([date_well] * num_points)
-        all_pos.extend([pos] * num_points)
-        all_intensities.extend(intensities)
-        all_indices.extend(indices)
-        all_validity.extend(validity)
-
-    # 4. Create DataFrame
+    print("Generating Diagnostic Plots...")
     df_background_qc = pd.DataFrame({
-        "date-well": all_date_wells,
-        "pos": all_pos,
-        "intensities": all_intensities,
-        "indices": all_indices,      # The projected diagonal position (0 to 2048)
-        "validity": all_validity     # True if real background, False if jumped over cell
-    })   
+        "date-well": qc_data['date_wells'],
+        "pos": qc_data['pos'],
+        "intensities": qc_data['intensities'],
+        "indices": qc_data['indices'],
+        "validity": qc_data['validity']
+    })
+    
+    if not df_background_qc.empty:
+        # Intra-Well Variance (Stage Stability)
+        fig1 = plot_background_panels(df_background_qc, mode='intra-well', cols=3, bin_width=50)
+        fig1.savefig(f'{root_dir_path}/background_qc_intra_well.png', dpi=300)
+        plt.close(fig1)
+        
+        # Inter-Well Variance (Batch Consistency)
+        fig2 = plot_background_panels(df_background_qc, mode='inter-well', cols=3, bin_width=50)
+        fig2.savefig(f'{root_dir_path}/background_qc_inter_well.png', dpi=300)
+        plt.close(fig2)
+        
+        print("Done. Plots saved.")
+    else:
+        print("No valid background data collected for plotting.")
 
-
-    fig = plot_background_panels(df_background_qc, mode = 'intra-well', cols = 3, bin_width = 50)
-    fig.savefig(f'{root_dir}/{date}_background_intra_well.png', dpi=500)
-
-    fig = plot_background_panels(df_background_qc, mode = 'inter-well', cols = 3, bin_width = 50)
-    fig.savefig(f'{root_dir}/{date}_background_inter_well.png', dpi=500)
+if __name__ == "__main__":
+    main()
