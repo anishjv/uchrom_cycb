@@ -339,7 +339,7 @@ def plot_background_panels(
 
 def process_movie(
     gfp_path, seg_path, xlsx_path, 
-    bkg_map_stack, intensity_map,
+    bkg_map, intensity_map,
     diagnostic_container # Dictionary to append lists for QC plots
 ):
     """
@@ -350,7 +350,7 @@ def process_movie(
         gfp_path: str, Path to the GFP movie TIFF file.
         seg_path: str, Path to the segmentation movie TIFF file.
         xlsx_path: str, Path to the analysis results Excel file.
-        bkg_map_stack: np.ndarray, 3D stack of background maps (Time, Y, X).
+        bkg_map: np.ndarray, 2D background maps.
         intensity_map: np.ndarray, 2D intensity correction map.
         diagnostic_container: dict, Shared dictionary to store plotting data from Frame 0.
     OUTPUTS:
@@ -376,14 +376,12 @@ def process_movie(
 
         img = gfp_stack[t]
         seg = seg_stack[t] if len(seg_stack) > t else seg_stack[-1]
-        current_bkg = bkg_map_stack[t] if t < bkg_map_stack.shape[0] else bkg_map_stack[-1]
-
 
         if seg.shape != img.shape:
             seg = resize(seg, img.shape, order=0, preserve_range=True, anti_aliasing=False).astype(seg.dtype)
         
         # Correction
-        corr_img = (img.astype(float) - current_bkg) / intensity_map
+        corr_img = (img.astype(float) - bkg_map) / intensity_map
         intensities, indices, is_valid, _ = measure_diagonal_network_path(corr_img, seg)
         
         # --- A. Offset Calculation (For Excel) ---
