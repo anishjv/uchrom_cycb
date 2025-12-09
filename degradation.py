@@ -52,9 +52,8 @@ def retrieve_traces(
         intensity = analysis_df.query(f"particle=={id}")[f"{wl}"].to_numpy()
         semantic = analysis_df.query(f"particle=={id}")["semantic_smoothed"].to_numpy()
         bkg = analysis_df.query(f"particle=={id}")[f"{wl}_bkg_corr"].to_numpy()
-        intensity_corr = analysis_df.query(f"particle=={id}")[
-            f"{wl}_int_corr"
-        ].to_numpy()
+        shading = analysis_df.query(f"particle=={id}")[f"{wl}_int_corr"].to_numpy()
+        offset = analysis_df.query(f"particle=={id}")["offset"].to_numpy()
         frames = analysis_df.query(f"particle=={id}")["frame"].to_numpy()
 
         # Always remove traces that start in mitosis
@@ -75,7 +74,7 @@ def retrieve_traces(
         first_mitosis = props["left_bases"][0]
         last_mitosis = props["right_bases"][0]
 
-        corr_intensity = (intensity - bkg) * intensity_corr
+        corr_intensity = ((intensity - bkg) * shading) - offset
         intensity_traces.append(corr_intensity)
         semantic_traces.append(semantic)
         frame_traces.append(frames)

@@ -194,13 +194,40 @@ def compute_cell_images(
 
     return cell, tophat_cell, mask_cropped, deconv_cell
 
+def determine_removal_mask(
+    tophat_cell: np.ndarray,
+    cell: np.ndarray,
+    cell_mask: np.ndarray,
+    config: Optional[ChromatinSegConfig] = None,
+) -> Optional[np.ndarray]:
+    """
+    Compute removal mask for metaphase plate based on eccentricity and Euler number.
+    ---------------------------------------------------------------------------------------------------------------
+    INPUTS:
+        tophat_cell: np.ndarray, top-hat filtered cell image
+        cell: np.ndarray, cropped chromatin image
+        config: Optional[ChromatinSegConfig], configuration parameters (default=None)
+    OUTPUTS:
+        removal_mask: np.ndarray or None if the cell was lost
+    """
+    if config is None:
+        config = ChromatinSegConfig()
+
+    labeled_regions, max_lbl = get_largest_signal_regions(tophat_cell, cell, cell_mask)
+
+    if max_lbl is None:
+        return None
+
+    removal_mask = remove_metaphase_plate(max_lbl, labeled_regions, cell, config)
+    return removal_mask
+
 
 def get_largest_signal_regions(
-    tophat_cell: np.ndarray, cell: np.ndarray
+    tophat_cell: np.ndarray, cell: np.ndarray, cell_mask: np.ndarray
 ) -> tuple[np.ndarray, Optional[int]]:
     """
     Segments the cell and returns the brightest region.
-    ---------------------------------------------------------------------------------------------------------------
+    -----------------------------------------------------------
     INPUTS:
         tophat_cell: np.ndarray, top-hat filtered cell image
         cell: np.ndarray, cropped chromatin image
@@ -208,8 +235,11 @@ def get_largest_signal_regions(
         labeled: np.ndarray, labeled image with background = 0
         max_intensity_lbl: int or None, label of the brightest region
     """
-    thresh = threshold_otsu(tophat_cell)
-    thresh_cell = tophat_cell > thresh
+    cell_in_mask = np.copy(tophat_cell)
+    cell_in_mask[~cell_mask] = 0
+
+    thresh = threshold_otsu(cell_in_mask[cell_in_mask > 0])
+    thresh_cell = cell_in_mask > thresh
     labeled, num_labels = label(thresh_cell, return_num=True, connectivity=1)
 
     if num_labels == 0:
@@ -222,37 +252,6 @@ def get_largest_signal_regions(
     max_intensity_lbl = labels[region_intensities.index(max_intensity)]
 
     return labeled, max_intensity_lbl
-
-
-def calculate_region_orientation(region_mask: np.ndarray, cell: np.ndarray) -> float:
-    """
-    Calculate the orientation angle of a region using its principal axes.
-    ---------------------------------------------------------------------------------------------------------------
-    INPUTS:
-        region_mask: np.ndarray, boolean mask of the region
-        cell: np.ndarray, intensity image
-    OUTPUTS:
-        angle_degrees: float, orientation angle in degrees (0-180)
-    """
-    # Get region properties
-    props = regionprops(label(region_mask.astype(int)), intensity_image=cell)[0]
-    mu20 = props.weighted_moments_central[2, 0]
-    mu02 = props.weighted_moments_central[0, 2]
-    mu11 = props.weighted_moments_central[1, 1]
-
-    # Get the orientation (returns angle in radians, -π/2 to π/2)
-    orientation_weighted_rad = 0.5 * np.arctan2(2 * mu11, mu20 - mu02)
-
-    # Convert to degrees
-    angle_degrees = np.degrees(orientation_weighted_rad)
-
-    # Transform from regionprops coordinate system to extractRect coordinate system:
-    # regionprops: counter-clockwise from π/2 (vertical), range -90° to 90°
-    # extractRect: clockwise from 0 (horizontal), range 0° to 180°
-    # Transformation: flip direction and shift reference
-    transformed_angle = (-angle_degrees + 90) % 180
-
-    return transformed_angle
 
 
 def remove_metaphase_plate(
@@ -335,32 +334,35 @@ def remove_metaphase_plate(
     return rect_mask
 
 
-def determine_removal_mask(
-    tophat_cell: np.ndarray,
-    cell: np.ndarray,
-    config: Optional[ChromatinSegConfig] = None,
-) -> Optional[np.ndarray]:
+def calculate_region_orientation(region_mask: np.ndarray, cell: np.ndarray) -> float:
     """
-    Compute removal mask for metaphase plate based on eccentricity and Euler number.
+    Calculate the orientation angle of a region using its principal axes.
     ---------------------------------------------------------------------------------------------------------------
     INPUTS:
-        tophat_cell: np.ndarray, top-hat filtered cell image
-        cell: np.ndarray, cropped chromatin image
-        config: Optional[ChromatinSegConfig], configuration parameters (default=None)
+        region_mask: np.ndarray, boolean mask of the region
+        cell: np.ndarray, intensity image
     OUTPUTS:
-        removal_mask: np.ndarray or None if the cell was lost
+        angle_degrees: float, orientation angle in degrees (0-180)
     """
-    if config is None:
-        config = ChromatinSegConfig()
+    # Get region properties
+    props = regionprops(label(region_mask.astype(int)), intensity_image=cell)[0]
+    mu20 = props.weighted_moments_central[2, 0]
+    mu02 = props.weighted_moments_central[0, 2]
+    mu11 = props.weighted_moments_central[1, 1]
 
-    labeled_regions, max_lbl = get_largest_signal_regions(tophat_cell, cell)
+    # Get the orientation (returns angle in radians, -π/2 to π/2)
+    orientation_weighted_rad = 0.5 * np.arctan2(2 * mu11, mu20 - mu02)
 
-    if max_lbl is None:
-        return None
+    # Convert to degrees
+    angle_degrees = np.degrees(orientation_weighted_rad)
 
-    removal_mask = remove_metaphase_plate(max_lbl, labeled_regions, cell, config)
-    return removal_mask
+    # Transform from regionprops coordinate system to extractRect coordinate system:
+    # regionprops: counter-clockwise from π/2 (vertical), range -90° to 90°
+    # extractRect: clockwise from 0 (horizontal), range 0° to 180°
+    # Transformation: flip direction and shift reference
+    transformed_angle = (-angle_degrees + 90) % 180
 
+    return transformed_angle
 
 def segment_mask_unaligned(
     removal_mask: np.ndarray,
@@ -385,23 +387,39 @@ def segment_mask_unaligned(
         config = ChromatinSegConfig()
 
     # Remove metaphase plate from deconvolved image
-    cell_minus_struct = np.copy(tophat_cell)
-    cell_minus_struct[removal_mask] = 0
+    cell_in_mask = np.copy(tophat_cell)
+    cell_in_mask[~cell_mask] = 0
+    cell_in_mask_minus_struct = np.copy(cell_in_mask)
+    cell_in_mask_minus_struct[removal_mask] = 0
 
-    # Threshold the image
-    thresh = threshold_li(cell_minus_struct[cell_minus_struct > 0])
-    labeled = label(cell_minus_struct > thresh, connectivity=1)
-    labeled = remove_small_objects(labeled, min_size=config.min_chromatin_area)
+    validation_thresh = threshold_li(cell_in_mask[cell_in_mask > 0])
+    validation_mask = cell_in_mask > validation_thresh
+    validation_labeled = label(validation_mask, connectivity = 1)
+    validation_labeled_nop = np.copy(validation_labeled)
+    validation_labeled_nop[removal_mask] = 0
 
-    # Only keep objects that are within the cell mask
-    # Set any labeled regions outside the cell mask to 0
-    labeled[~cell_mask] = 0
+    if np.sum(validation_labeled_nop > 0) < 10:
+        '''
+        If this is triggered, almost no chromatin exists outside the metaphase plate.
+        Attempting to threshold an image of this type according to the code under "else" is equivalent to 
+        trying to threshold background and is erroneous. In this case we threshold according to cell_in_mask, 
+        as thresholding according to cell_in_mask_minus_struct is ~ equivalent to trying to segment background
+        '''
+        print('Almost no chromatin outside the removal mask (metaphase plate)')
+        labeled = validation_labeled_nop
+        total_chromatin_mask = validation_mask
+    else:
+        # Threshold the image
+        print('Found chromatin outside the removal mask (metaphase plate)')
+        thresh = threshold_li(cell_in_mask_minus_struct[cell_in_mask_minus_struct > 0]) #only consider the pixels > 0 for threshold comp
+        thresh_cell = cell_in_mask_minus_struct > thresh
+        labeled = label(thresh_cell, connectivity = 1)
+        labeled = remove_small_objects(labeled, min_size=config.min_chromatin_area)
 
-    # Clear border objects (this will remove objects touching the image border)
-    labeled = clear_border(labeled)
+        # Clear border objects (this will remove objects touching the image border)
+        #labeled = clear_border(labeled)
 
-    total_chromatin_mask = tophat_cell > thresh
-    total_chromatin_mask[~cell_mask] = 0
+        total_chromatin_mask = cell_in_mask > thresh
 
     return labeled, total_chromatin_mask
 
@@ -545,12 +563,13 @@ def unaligned_chromatin(
             int(row["semantic_smoothed"]),
         )
 
-        cell, tophat_cell, cell_mask, deconv_cell = compute_cell_images(
-            instance, chromatin, f, l, zoom_factor, config
-        )
-
         if semantic == 1:
-            removal_mask = determine_removal_mask(tophat_cell, cell, config)
+
+            cell, tophat_cell, cell_mask, _ = compute_cell_images(
+                            instance, chromatin, f, l, zoom_factor, config
+                            )
+
+            removal_mask = determine_removal_mask(tophat_cell, cell, cell_mask, config)
 
             if removal_mask is None: #this happens only if no chromatin was found
                 print("Lost track of cell! Moving on to next cell")
@@ -739,12 +758,12 @@ def visualize_chromatin_processing(
         axes[row, 2].set_yticks([])
 
         # Column 4: Metaphase plate mask
-        removal_mask = determine_removal_mask(tophat_cell, cell, config)
+        removal_mask = determine_removal_mask(tophat_cell, cell, cell_mask, config)
         if removal_mask is not None:
             axes[row, 3].imshow(tophat_cell, cmap="gray")
 
             # Get the original region mask for comparison
-            labeled_regions, max_lbl = get_largest_signal_regions(tophat_cell, cell)
+            labeled_regions, max_lbl = get_largest_signal_regions(tophat_cell, cell, cell_mask)
             if max_lbl is not None:
                 region_mask = labeled_regions == max_lbl
 
@@ -920,6 +939,7 @@ if __name__ == "__main__":
             if len(cells_with_metaphase) > 0:
                 # Randomly select a cell
                 cell_id = random.choice(cells_with_metaphase)
+                #cell_id = 43
                 metaphase_frames = analysis_df.query(
                     f"particle == {cell_id} and semantic_smoothed == 1"
                 )
