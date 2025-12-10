@@ -302,8 +302,9 @@ if __name__ == "__main__":
         name_stub = re.search(
             r"[A-H]([1-9]|[0][1-9]|[1][0-2])_s(\d{2}|\d{1})", str(dir)
         ).group()
-        name_stub = str(name_stub) + '_'
-        an_paths = glob.glob(f"{dir}/*analysis.xlsx")
+        name_stub = str(name_stub) #temporary (removed + '-')
+        an_paths_t = glob.glob(f"{dir}/*analysis.xlsx")
+        an_paths = [f for f in an_paths_t if '_analysis.xlsx' not in f] #temporary
         inst_paths = glob.glob(f"{dir}/*instance_movie.tif")
         chrom_paths = [
             path
