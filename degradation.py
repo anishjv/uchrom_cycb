@@ -143,7 +143,7 @@ def cycb_chromatin_batch_analyze(
         # Validate CyclinB traces and create validity mapping
         valid_cells = {}
         for i, trace in enumerate(intensity):
-            is_valid, _ = validate_cyclin_b_trace(trace)
+            is_valid = validate_cyclin_b_trace(trace)
             if is_valid:
                 valid_cells[ids[i]] = True
             else:
