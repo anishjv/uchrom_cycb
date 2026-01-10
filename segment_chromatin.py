@@ -3,10 +3,10 @@ import numpy.typing as npt
 import pandas as pd
 from scipy.ndimage import zoom
 
-from typing import Optional
+from typing import Optional, Tuple
 
 import skimage
-from skimage.morphology import disk, binary_dilation, remove_small_objects
+from skimage.morphology import disk, binary_dilation, remove_small_objects, binary_erosion
 from skimage.filters import threshold_otsu, gaussian, threshold_li
 from skimage.measure import label, regionprops
 from skimage.segmentation import clear_border
@@ -69,7 +69,7 @@ def airy_disk_psf(NA, wavelength_nm, pixel_size_um, psf_size=51, oversample=1):
     kr[kr == 0] = 1e-10  # avoid divide by zero
     airy = (2 * j1(kr) / kr) ** 2
 
-    psf = airy
+    psf = airy / np.sum(airy)
     return psf
 
 
@@ -369,7 +369,8 @@ def segment_mask_unaligned(
     tophat_cell: np.ndarray,
     cell_mask: np.ndarray,
     config: Optional[ChromatinSegConfig] = None,
-) -> np.ndarray:
+) -> Tuple[np.ndarray, np.ndarray]:
+
     """
     Build a labeled image of unaligned chromosomes by removing structures from deconvolved image,
     thresholding, and clearing borders. Only keeps objects that are within the cell mask.
@@ -386,40 +387,51 @@ def segment_mask_unaligned(
     if config is None:
         config = ChromatinSegConfig()
 
-    # Remove metaphase plate from deconvolved image
-    cell_in_mask = np.copy(tophat_cell)
-    cell_in_mask[~cell_mask] = 0
-    cell_in_mask_minus_struct = np.copy(cell_in_mask)
-    cell_in_mask_minus_struct[removal_mask] = 0
+    # 1. Apply cell mask immediately using a view to save memory
+    # We only care about pixels where cell_mask is True
+    cell_pixels = tophat_cell[cell_mask]
+    
+    if cell_pixels.size == 0:
+        return np.zeros_like(tophat_cell, dtype=int), np.zeros_like(tophat_cell, dtype=bool)
 
-    validation_thresh = threshold_li(cell_in_mask[cell_in_mask > 0])
-    validation_mask = cell_in_mask > validation_thresh
-    validation_labeled = label(validation_mask, connectivity = 1)
-    validation_labeled_nop = np.copy(validation_labeled)
-    validation_labeled_nop[removal_mask] = 0
-
-    if np.sum(validation_labeled_nop > 0) < 10:
-        '''
-        If this is triggered, almost no chromatin exists outside the metaphase plate.
-        Attempting to threshold an image of this type according to the code under "else" is equivalent to 
-        trying to threshold background and is erroneous. In this case we threshold according to cell_in_mask, 
-        as thresholding according to cell_in_mask_minus_struct is ~ equivalent to trying to segment background
-        '''
+    # 2. Initial validation threshold
+    global_thresh = threshold_li(cell_pixels[cell_pixels > 0])
+    validation_mask = (tophat_cell > global_thresh) & cell_mask
+    
+    # Check if chromatin exists outside the removal mask
+    # Logical AND NOT is faster than copying and zeroing out
+    chromatin_outside = validation_mask & ~removal_mask
+    
+    if np.sum(chromatin_outside) < 10:
         print('Almost no chromatin outside the removal mask (metaphase plate)')
-        labeled = validation_labeled_nop
         total_chromatin_mask = validation_mask
+        # No unaligned chromosomes to label in this branch based on logic
+        labeled = label(total_chromatin_mask, connectivity=1)
     else:
-        # Threshold the image
         print('Found chromatin outside the removal mask (metaphase plate)')
-        thresh = threshold_li(cell_in_mask_minus_struct[cell_in_mask_minus_struct > 0]) #only consider the pixels > 0 for threshold comp
-        thresh_cell = cell_in_mask_minus_struct > thresh
-        labeled = label(thresh_cell, connectivity = 1)
-        labeled = remove_small_objects(labeled, min_size=config.min_chromatin_area)
+        
+        # 3. Targeted thresholding: exclude the metaphase plate area from the calculation
+        # to find dimmer unaligned fragments
+        target_indices = cell_mask & ~removal_mask
+        target_pixels = tophat_cell[target_indices]
+        
+        # Recalculate threshold specifically for the "unaligned" zone
+        unaligned_thresh = threshold_li(target_pixels[target_pixels > 0])
+        
+        # Create masks
+        thresh_cell = (tophat_cell > unaligned_thresh) & target_indices
+        total_chromatin_mask = (tophat_cell > unaligned_thresh) & cell_mask
+        
+        # 4. Clean up labeled objects
+        labeled = label(thresh_cell, connectivity=1)
+        if config.min_chromatin_area > 0:
+            labeled = remove_small_objects(labeled, min_size=config.min_chromatin_area)
 
-        # Clear border objects (this will remove objects touching the image border)
-        #labeled = clear_border(labeled)
-
-        total_chromatin_mask = cell_in_mask > thresh
+    # 5. Consistent Post-processing
+    # Apply border clearing to both outputs to ensure consistency
+    border_mask = binary_erosion(cell_mask, disk(1))
+    labeled = clear_border(labeled, mask=border_mask)
+    total_chromatin_mask = clear_border(total_chromatin_mask.astype(bool), mask=border_mask)
 
     return labeled, total_chromatin_mask
 
@@ -555,7 +567,6 @@ def unaligned_chromatin(
     print(f"Working on cell {identity}")
 
     visualization_stacks = []
-
     for _, row in frames_data.iterrows():
         f, l, semantic = (
             int(row["frame"]),

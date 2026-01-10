@@ -161,27 +161,29 @@ def unpack_cycb_chromatin(
             changept = t_max
 
         for t, val in enumerate(cell_trace):
-            if t_min <= t <= t_max:
 
-                # Label phases
-                if t <= low_bound:
-                    flag = "no-deg"
-                elif low_bound < t < changept:
-                    flag = "slow"
-                else:
-                    flag = "fast"
+            if t < t_min:
+                flag = "before mitosis"
+            elif t_min <= t < low_bound:
+                flag = 'no deg'
+            elif low_bound <= t < changept:
+                flag = 'slow'
+            elif changept <= t < t_max:
+                flag = 'fast'
+            else:
+                flag = "after mitosis"
 
-                # Append unpacked variables
-                min_after_changept.append(4 * (t - changept))
-                unpacked_smooth_cycb.append(val)
-                unpacked_dcycb_dt.append(deg_rate[t])
-                unpacked_uchromatin_area.append(uchromatin[t])
-                unpacked_achromatin_area.append(achromatin[t])
-                unpacked_pos_in_mitosis.append((t - t_min) / (t_max - t_min))
-                phase_flag.append(flag)
-                unpacked_tracking_ids.append(tracking_ids[t])
-                unpacked_frames.append(frames[t])
-                unpacked_uchrom_nums.append(uchrom_n[t])
+            # Append unpacked variables
+            min_after_changept.append(4 * (t - changept))
+            unpacked_smooth_cycb.append(val)
+            unpacked_dcycb_dt.append(deg_rate[t])
+            unpacked_uchromatin_area.append(uchromatin[t])
+            unpacked_achromatin_area.append(achromatin[t])
+            unpacked_pos_in_mitosis.append((t - t_min) / (t_max - t_min))
+            phase_flag.append(flag)
+            unpacked_tracking_ids.append(tracking_ids[t])
+            unpacked_frames.append(frames[t])
+            unpacked_uchrom_nums.append(uchrom_n[t])
 
     return (
         unpacked_smooth_cycb,
@@ -376,7 +378,7 @@ def save_chromatin_crops(
         return base_rgba
 
     #  Metaphase overlay
-    labeled_regions, max_lbl = get_largest_signal_regions(tophat_cell, cell)
+    labeled_regions, max_lbl = get_largest_signal_regions(tophat_cell, cell, cell_mask)
     if max_lbl is not None:
         metaphase_mask = labeled_regions == max_lbl
     metaphase_overlay = np.zeros((H, W, 4), dtype=float)
@@ -421,7 +423,8 @@ def save_chromatin_crops(
 
 def visualize_chromatin_hd5(
     file_path: str,
-    num_measured: int | None = None,
+    frames: list[int],
+    num_frames_deg: int | None = None,
     max_cells: int = 20,
     chunk_size: int = 6,
 ):
@@ -439,13 +442,13 @@ def visualize_chromatin_hd5(
         cell_groups = sorted(f.keys(), key=lambda x: int(x.split("_")[-1]))
         num_images = len(cell_groups)
 
-        if num_measured:
+        if num_frames_deg:
             offset = (
-                num_measured - num_images
-            )  # all mitotic timepoints get an image, but my measurements are only from CycB peak onwards (a few timepoints into mitosis)
+                num_frames_deg - num_images
+            )  # all mitotic timepoints get an image, but my degradation measurements only from the CycB peak onwards (a few timepoints into mitosis)
             print(
                 f"Saved stacks contain {num_images} cells; "
-                f"only {num_measured} were measured. Adjusting indices accordingly."
+                f"only {num_frames_deg} were valid degradation frames. Adjusting indices accordingly."
             )
 
         n_cells = min(len(cell_groups), max_cells)
@@ -489,7 +492,13 @@ def visualize_chromatin_hd5(
                 ax.tick_params(left=False, bottom=False, labelleft=False)
                 for spine in ax.spines.values():
                     spine.set_visible(False)
-                ax.set_xlabel(str(start + col + offset), fontsize=16)
+                rel_label = start + col + offset
+                abs_label = frames[start+col]
+                label = f'{rel_label},{abs_label}'
+                ax.set_xlabel(
+                    label, 
+                    fontsize=16
+                    )
                 ax.xaxis.set_label_position("bottom")
 
             plt.tight_layout()

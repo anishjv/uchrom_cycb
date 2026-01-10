@@ -163,8 +163,8 @@ def cycb_chromatin_batch_analyze(
                 "u_chromatin_area": [],
                 "u_chromatin_intensity": [],
                 "t_chromatin_intensity": [],
-                "num_u_chromosomes": [],
                 "t_chromatin_area": [],
+                "num_u_chromosomes": [],
             }
         )
 
@@ -198,9 +198,9 @@ def cycb_chromatin_batch_analyze(
                 "semantic": semantic[i],
                 "u_chromatin_area": data_tuple[0],
                 "u_chromatin_intensity": data_tuple[1],
+                "t_chromatin_area": data_tuple[4],
                 "t_chromatin_intensity": data_tuple[2],
                 "num_u_chromosomes": data_tuple[3],
-                "t_chromatin_area": data_tuple[4],
             }
 
             # Extend the dataframe with this cell's data

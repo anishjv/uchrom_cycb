@@ -344,7 +344,7 @@ def validate_cyclin_b_trace(trace: np.ndarray):
     """
 
     # Criterion 1: Check for peak with prominence > 5
-    peaks, properties = find_peaks(trace, prominence=5, width=0)
+    peaks, properties = find_peaks(trace, prominence=3, width=0)
     if len(peaks) >= 1:
         pass
     else:
