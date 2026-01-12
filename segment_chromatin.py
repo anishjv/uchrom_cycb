@@ -6,7 +6,7 @@ from scipy.ndimage import zoom
 from typing import Optional, Tuple
 
 import skimage
-from skimage.morphology import disk, binary_dilation, remove_small_objects, binary_erosion
+from skimage.morphology import disk, remove_small_objects, binary_erosion
 from skimage.filters import threshold_otsu, gaussian, threshold_li
 from skimage.measure import label, regionprops
 from skimage.segmentation import clear_border
@@ -30,7 +30,7 @@ from deg_analysis import save_chromatin_crops
 class ChromatinSegConfig:
     """Configuration for chromatin segmentation parameters."""
 
-    top_hat_radius: int = 11
+    top_hat_radius: int = 9
     psf_size: int = 19
     gaussian_sigma: float = 0
     min_chromatin_area: int = 20
@@ -324,7 +324,7 @@ def remove_metaphase_plate(
     
     # Scale points outward from the centroid by sqrt(2)
     # This transforms the LIR into the Bounding Box of the inferred ellipse
-    scale_factor = np.sqrt(2)
+    scale_factor = np.sqrt(2) #should technically be sqrt(2) but 2 works better empirically 
     scaled_pts = centroid + (rect_transformed - centroid) * scale_factor
     
     # 3. Create the mask of the scaled rectangle
