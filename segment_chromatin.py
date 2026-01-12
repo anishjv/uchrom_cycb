@@ -311,27 +311,34 @@ def remove_metaphase_plate(
         print(e)
         return np.zeros_like(labeled, dtype=bool)
 
+    # 2. Geometric Scaling Logic (The "sqrt(2)" Rule)
+    # Convert to float for precision during scaling
     rect_coords_ori = np.asarray(rect_coords_ori)
     rect_transformed = np.zeros_like(rect_coords_ori)
     rect_transformed[:, 0] = rect_coords_ori[:, 1]  # swap (x, y) to (y, x)
     rect_transformed[:, 1] = rect_coords_ori[:, 0]  # swap (x, y) to (y, x)
-    rect_transformed = np.asarray(rect_transformed, dtype=np.int64)
+    rect_transformed = np.asarray(rect_transformed, dtype=np.float32) 
+    
+    # Calculate the centroid of the LIR
+    centroid = np.mean(rect_transformed, axis=0)
+    
+    # Scale points outward from the centroid by sqrt(2)
+    # This transforms the LIR into the Bounding Box of the inferred ellipse
+    scale_factor = np.sqrt(2)
+    scaled_pts = centroid + (rect_transformed - centroid) * scale_factor
+    
+    # 3. Create the mask of the scaled rectangle
+    # OpenCV fillPoly expects (x, y) in int32
+    scaled_pts_int = scaled_pts.astype(np.int32)
+    
+    scaled_rect_mask = np.zeros_like(labeled, dtype=np.uint8)
+    cv2.fillPoly(scaled_rect_mask, [scaled_pts_int], 1)
+    
+    # 4. The Intersection Filter
+    # Only keep original pixels that fall within the biologically likely bounding box
+    final_plate_mask = (scaled_rect_mask.astype(bool) & region_mask)
 
-    rect_mask = np.zeros_like(labeled, dtype="uint8")
-    cv2.fillPoly(rect_mask, [rect_transformed], 255).astype("bool")
-
-    # create custom structuring element
-    new_shape = (rect_mask.shape[0] // 1, rect_mask.shape[0] // 1)
-    struct = np.asarray(Image.fromarray(rect_mask).resize(new_shape))
-    bbox_coords = bbox(struct)
-    struct = struct[
-        bbox_coords[0] : bbox_coords[1], bbox_coords[2] : bbox_coords[3]
-    ]  # for efficiency
-    rect_mask = binary_dilation(
-        rect_mask, struct
-    )  # dilate to approach size of circumscribed (not inscribed) rectangle
-
-    return rect_mask
+    return final_plate_mask
 
 
 def calculate_region_orientation(region_mask: np.ndarray, cell: np.ndarray) -> float:
