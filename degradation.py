@@ -85,6 +85,51 @@ def retrieve_traces(
     return intensity_traces, semantic_traces, ids, first_tps, frame_traces, last_tps
 
 
+def area_model(N, A_max, f, beta):
+    "Poisson germ-grain area model with a noise term (beta)"
+    return A_max * (1 - (1 - f)**N) + beta
+
+
+def predict_integer_chromosomes(
+    A_obs: float, 
+    A_max: float,
+    f: float,
+    beta: float,
+    sigma_0: float,
+    gamma:float,
+    max_n: int = 100
+    ):
+    """
+    Defines a probability distribution over possible numbers of unaligned chromosomes 
+    given an observed unaligned chromatin area measurement
+    """
+    n_options = np.arange(0, max_n + 1)
+    
+    # Calculates predicted means for every possible integer n
+    mu_n = area_model(n_options, A_max, f, beta)
+    
+    # Calculates predicted sigmas for every possible integer n
+    sigma_n = sigma_0 * (n_options + 1)**gamma
+    
+    # Calculate the log-likelihood for each n
+    # (Leaving out constants like sqrt(2pi) as they don't change the argmax)
+    log_likelihoods = -np.log(sigma_n) - 0.5 * ((A_obs - mu_n) / sigma_n)**2
+    
+    # Find the most likely integer (the Mode)
+    n_best = n_options[np.argmax(log_likelihoods)]
+    
+    # Calculate a Credible Interval (normalized probabilities)
+    probs = np.exp(log_likelihoods - np.max(log_likelihoods)) # Undo the log
+    probs /= np.sum(probs) # Normalize
+    
+    # Cumulative distribution to find the 95% range
+    cumulative_prob = np.cumsum(probs)
+    n_low = n_options[np.searchsorted(cumulative_prob, 0.025)]
+    n_high = n_options[np.searchsorted(cumulative_prob, 0.975)]
+    
+    return int(n_best), (int(n_low), int(n_high)), probs
+
+
 def cycb_chromatin_batch_analyze(
     positions: list,
     analysis_paths: list,
@@ -164,7 +209,9 @@ def cycb_chromatin_batch_analyze(
                 "u_chromatin_intensity": [],
                 "t_chromatin_intensity": [],
                 "t_chromatin_area": [],
-                "num_u_chromosomes": [],
+                "u_chrom_num": [],
+                "u_chrom_num_low": [],
+                "u_chrom_num_high": []
             }
         )
 
@@ -182,6 +229,15 @@ def cycb_chromatin_batch_analyze(
                 cell_id, analysis_df, instance, chromatin, config=config
             )
 
+            u_chromatin_area = data_tuple[0]
+            u_chrom_num, u_chrom_num_low, u_chrom_num_high = predict_integer_chromosomes(
+                u_chromatin_area,
+                1050.85,
+                0.0468,
+                79.11,
+                66.87,
+                0.160
+            )
             visualization_stacks = data_tuple[8]
 
             if data_tuple is None:
@@ -200,7 +256,10 @@ def cycb_chromatin_batch_analyze(
                 "u_chromatin_intensity": data_tuple[1],
                 "t_chromatin_area": data_tuple[4],
                 "t_chromatin_intensity": data_tuple[2],
-                "num_u_chromosomes": data_tuple[3],
+                "u_chrom_num": u_chrom_num,
+                "u_chrom_num_low": u_chrom_num_low,
+                "u_chrom_num_high": u_chrom_num_high,
+
             }
 
             # Extend the dataframe with this cell's data
@@ -217,7 +276,7 @@ def cycb_chromatin_batch_analyze(
                     "n_frames": len(frames),
                     "frame_start": frames[0],
                     "frame_end": frames[-1],
-                    "num_removal_regions": data_tuple[5],
+                    "num_removal_frames": data_tuple[5],
                     "first_removal_frame": data_tuple[6],
                     "last_removal_frame": data_tuple[7],
                 }

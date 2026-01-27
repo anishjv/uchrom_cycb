@@ -324,7 +324,7 @@ def remove_metaphase_plate(
     
     # Scale points outward from the centroid by sqrt(2)
     # This transforms the LIR into the Bounding Box of the inferred ellipse
-    scale_factor = np.sqrt(2) #should technically be sqrt(2) but 2 works better empirically 
+    scale_factor = np.sqrt(2)
     scaled_pts = centroid + (rect_transformed - centroid) * scale_factor
     
     # 3. Create the mask of the scaled rectangle
@@ -647,13 +647,9 @@ def unaligned_chromatin(
 
     if successful_removal_frames:
         successful_removal_frames.sort()
-        ranges = find_contiguous_ranges(successful_removal_frames)
-        num_removal_regions = len(ranges)
+        num_removal_frames = len(successful_removal_frames)
         first_removal_frame = successful_removal_frames[0]
         last_removal_frame = successful_removal_frames[-1]
-        print(
-            f"Cell {identity}: Metaphase plates were removed from time point {first_removal_frame} to {last_removal_frame} in {num_removal_regions} contigous regions"
-        )
     else:
         print(f"Cell {identity}: No metaphase plates were removed")
 
@@ -663,7 +659,7 @@ def unaligned_chromatin(
         list(total_chromatin_intensity),
         list(num_signals),
         list(total_chromatin_area),
-        num_removal_regions,
+        num_removal_frames,
         first_removal_frame,
         last_removal_frame,
         visualization_stacks
