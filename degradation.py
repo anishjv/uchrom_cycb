@@ -230,7 +230,7 @@ def cycb_chromatin_batch_analyze(
             )
 
             u_chromatin_area = data_tuple[0]
-            u_chrom_num, u_chrom_num_low, u_chrom_num_high = predict_integer_chromosomes(
+            u_chrom_num, (u_chrom_num_low, u_chrom_num_high), _ = predict_integer_chromosomes(
                 u_chromatin_area,
                 1050.85,
                 0.0468,
