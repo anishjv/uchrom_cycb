@@ -463,12 +463,12 @@ def main():
     if not df_background_qc.empty:
         # Intra-Well Variance (Stage Stability)
         fig1 = plot_background_panels(df_background_qc, mode='intra-well', cols=3, bin_width=50)
-        fig1.savefig(f'{root_dir_path}/background_qc_intra_well.png', dpi=300)
+        fig1.savefig(f'{root_dir_path}/qc_intra_well.png', dpi=300)
         plt.close(fig1)
         
         # Inter-Well Variance (Batch Consistency)
         fig2 = plot_background_panels(df_background_qc, mode='inter-well', cols=3, bin_width=50)
-        fig2.savefig(f'{root_dir_path}/background_qc_inter_well.png', dpi=300)
+        fig2.savefig(f'{root_dir_path}/qc_inter_well.png', dpi=300)
         plt.close(fig2)
         
         print("Done. Plots saved.")
