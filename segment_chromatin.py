@@ -506,33 +506,6 @@ def segment_unaligned_chromosomes(
     return measurements, labeled
 
 
-def find_contiguous_ranges(frame_list: list[int]) -> list[tuple[int, int]]:
-    """
-    Find contiguous ranges in a list of frame numbers.
-    ---------------------------------------------------------------------------------------------------------------
-    INPUTS:
-        frame_list: list[int], sorted list of frame numbers
-    OUTPUTS:
-        ranges: list[tuple[int, int]], list of (start, end) tuples for contiguous ranges
-    """
-    if not frame_list:
-        return []
-
-    ranges = []
-    start = frame_list[0]
-    end = frame_list[0]
-
-    for i in range(1, len(frame_list)):
-        if frame_list[i] == end + 1:
-            end = frame_list[i]
-        else:
-            ranges.append((start, end))
-            start = frame_list[i]
-            end = frame_list[i]
-
-    ranges.append((start, end))
-    return ranges
-
 
 def unaligned_chromatin(
     identity: int,
