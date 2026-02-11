@@ -1,7 +1,5 @@
 import numpy as np
-import findiff
 from scipy.optimize import curve_fit
-from statsmodels.nonparametric.kernel_regression import KernelReg
 from scipy.ndimage import binary_dilation
 from scipy.signal import find_peaks
 import matplotlib.pyplot as plt
@@ -345,19 +343,11 @@ def validate_cyclin_b_trace(trace: np.ndarray):
 
     # Criterion 1: Check for peak with prominence > 5
     peaks, properties = find_peaks(trace, prominence=3, width=0)
-    if len(peaks) >= 1:
-        pass
-    else:
-        print("[cyclinb validation] Could not find Cyclin B peak")
-        return np.nan
+    peaks_criterion = True if len(peaks) > 1 else False
 
     # Criterion 2: Check if range > 10
     trace_range = np.max(trace) - np.min(trace)
-    if trace_range > 10:
-        pass
-    else:
-        print("[cyclinb validation] Cyclin B range not sufficient")
-        return np.nan
+    range_criterion = True if trace_range > 10 else False
 
     # Criterion 3: Check left base > right base for main (tallest) peak
     # Find the tallest peak (highest prominence)
@@ -371,10 +361,6 @@ def validate_cyclin_b_trace(trace: np.ndarray):
     left_base_value = trace[left_bases[tallest_peak_idx]]
     right_base_value = trace[right_bases[tallest_peak_idx]]
 
-    if left_base_value > right_base_value:
-        pass
-    else:
-        print("[cyclinb validation] No observed hysterisis")
-        return np.nan
+    hysterisis_criterion = True if left_base_value > right_base_value else False
 
-    return True
+    return peaks_criterion, range_criterion, hysterisis_criterion

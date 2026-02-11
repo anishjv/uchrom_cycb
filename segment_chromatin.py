@@ -6,6 +6,7 @@ from scipy.ndimage import zoom
 from typing import Optional, Tuple
 
 import skimage
+from skimage.exposure import rescale_intensity
 from skimage.morphology import disk, remove_small_objects, binary_erosion
 from skimage.filters import threshold_otsu, gaussian, threshold_li
 from skimage.measure import label, regionprops
@@ -21,21 +22,21 @@ from pathlib import Path
 import glob
 import re
 import tifffile as tiff
-import random
-from PIL import Image
 from deg_analysis import save_chromatin_crops
-
+from changept import validate_cyclin_b_trace
+import sys
 
 @dataclass
 class ChromatinSegConfig:
     """Configuration for chromatin segmentation parameters."""
 
-    top_hat_radius: int = 9
+    top_hat_radius: int = 15
     psf_size: int = 19
     gaussian_sigma: float = 0
     min_chromatin_area: int = 20
     eccentricity_threshold: float = 0.7 #largest region must have eccentricty greater than threshold to be considered for metaphase plate detection
     euler_threshold: float = -2 # can be no more than three holes in the metaphase plate
+    truncate_z: Optional[float] = None
 
 
 def airy_disk_psf(NA, wavelength_nm, pixel_size_um, psf_size=51, oversample=1):
@@ -175,6 +176,7 @@ def compute_cell_images(
 
     # Processing pipeline for segmentation:
     # 1. Gaussian smoothing to reduce noise
+    cell = rescale_intensity(cell, out_range=(0, 1))
     smoothed_cell = gaussian(cell, sigma=config.gaussian_sigma)
 
     # 2. Deconvolution to improve resolution
@@ -192,7 +194,7 @@ def compute_cell_images(
         deconv_cell, disk(config.top_hat_radius)
     )
 
-    return cell, tophat_cell, mask_cropped, deconv_cell
+    return cell.astype('float32'), tophat_cell.astype('float32'), mask_cropped, deconv_cell.astype('float32')
 
 def determine_removal_mask(
     tophat_cell: np.ndarray,
@@ -219,7 +221,10 @@ def determine_removal_mask(
         return None
 
     removal_mask = remove_metaphase_plate(max_lbl, labeled_regions, cell, config)
-    return removal_mask
+    props = regionprops(label(removal_mask))
+    width = props[0].axis_minor_length if len(props)>0 else np.nan
+
+    return removal_mask, width
 
 
 def get_largest_signal_regions(
@@ -240,7 +245,7 @@ def get_largest_signal_regions(
 
     thresh = threshold_otsu(cell_in_mask[cell_in_mask > 0])
     thresh_cell = cell_in_mask > thresh
-    labeled, num_labels = label(thresh_cell, return_num=True, connectivity=1)
+    labeled, num_labels = label(thresh_cell, return_num=True)
 
     if num_labels == 0:
         return labeled, None
@@ -317,14 +322,15 @@ def remove_metaphase_plate(
     rect_transformed = np.zeros_like(rect_coords_ori)
     rect_transformed[:, 0] = rect_coords_ori[:, 1]  # swap (x, y) to (y, x)
     rect_transformed[:, 1] = rect_coords_ori[:, 0]  # swap (x, y) to (y, x)
-    rect_transformed = np.asarray(rect_transformed, dtype=np.float32) 
+    rect_transformed = np.asarray(rect_transformed, dtype=np.float32)
+
     
     # Calculate the centroid of the LIR
     centroid = np.mean(rect_transformed, axis=0)
     
-    # Scale points outward from the centroid by sqrt(2)
     # This transforms the LIR into the Bounding Box of the inferred ellipse
-    scale_factor = np.sqrt(2)
+    truncate_z = config.truncate_z
+    scale_factor = 1.56*np.sqrt(2)
     scaled_pts = centroid + (rect_transformed - centroid) * scale_factor
     
     # 3. Create the mask of the scaled rectangle
@@ -333,10 +339,7 @@ def remove_metaphase_plate(
     
     scaled_rect_mask = np.zeros_like(labeled, dtype=np.uint8)
     cv2.fillPoly(scaled_rect_mask, [scaled_pts_int], 1)
-    
-    # 4. The Intersection Filter
-    # Only keep original pixels that fall within the biologically likely bounding box
-    final_plate_mask = (scaled_rect_mask.astype(bool) & region_mask)
+    final_plate_mask = scaled_rect_mask.astype(bool)
 
     return final_plate_mask
 
@@ -410,12 +413,10 @@ def segment_mask_unaligned(
     chromatin_outside = validation_mask & ~removal_mask
     
     if np.sum(chromatin_outside) < 10:
-        print('Almost no chromatin outside the removal mask (metaphase plate)')
         total_chromatin_mask = validation_mask
         # No unaligned chromosomes to label in this branch based on logic
-        labeled = label(total_chromatin_mask, connectivity=1)
+        labeled = np.zeros_like(tophat_cell, dtype=int)
     else:
-        print('Found chromatin outside the removal mask (metaphase plate)')
         
         # 3. Targeted thresholding: exclude the metaphase plate area from the calculation
         # to find dimmer unaligned fragments
@@ -430,7 +431,7 @@ def segment_mask_unaligned(
         total_chromatin_mask = (tophat_cell > unaligned_thresh) & cell_mask
         
         # 4. Clean up labeled objects
-        labeled = label(thresh_cell, connectivity=1)
+        labeled = label(thresh_cell)
         if config.min_chromatin_area > 0:
             labeled = remove_small_objects(labeled, min_size=config.min_chromatin_area)
 
@@ -565,104 +566,91 @@ def unaligned_chromatin(
         config = ChromatinSegConfig()
 
     zoom_factor = adjust_zoom_factor(chromatin.shape, instance.shape)
-    frames_data = analysis_df.query(f"particle == {identity}")
+    frames_data = (
+        analysis_df[analysis_df["particle"] == identity]
+        .sort_values("frame")
+    )
 
-    results = []
-    successful_removal_frames = (
-        []
-    )  # Track frames where metaphase plate was successfully removed
-    print(f"Working on cell {identity}")
-
+    # Preallocate accumulators
+    u_area_trace = []
+    u_area_int_trace = []
+    u_num_trace = []
+    t_area_trace = []
+    t_area_int_trace = []
+    width_trace = []
     visualization_stacks = []
+    successful_removal_frames = []
+
     for _, row in frames_data.iterrows():
-        f, l, semantic = (
-            int(row["frame"]),
-            int(row["label"]),
-            int(row["semantic_smoothed"]),
-        )
+        f = int(row["frame"])
+        l = int(row["label"])
+        semantic = int(row["semantic_smoothed"])
+
+        # Default values (non-mitotic frame)
+        u_area = 0
+        u_area_int = 0
+        u_num = 0
+        t_area = 0
+        t_area_int = 0.0
+        width = 0
 
         if semantic == 1:
-
             cell, tophat_cell, cell_mask, _ = compute_cell_images(
-                            instance, chromatin, f, l, zoom_factor, config
-                            )
+                instance, chromatin, f, l, zoom_factor, config
+            )
 
-            removal_mask = determine_removal_mask(tophat_cell, cell, cell_mask, config)
+            removal_mask, width = determine_removal_mask(
+                tophat_cell, cell, cell_mask, config
+            )
 
-            if removal_mask is None: #this happens only if no chromatin was found
-                print("Lost track of cell! Moving on to next cell")
+            if removal_mask is None:
+                print(f"Lost track of cell {identity}, moving on")
                 return None
 
-            # Check if metaphase plate was successfully removed (non-zero removal mask)
-            if np.any(removal_mask):
-                successful_removal_frames.append(f)
+            successful_removal_frames.append(int(np.any(removal_mask)))
 
-            measurements, labeled_chromosmes = segment_unaligned_chromosomes(
+            (
+                u_area,
+                u_area_int,
+                u_num,
+                t_area,
+                t_area_int,
+            ), labeled_chromosomes = segment_unaligned_chromosomes(
                 cell, tophat_cell, removal_mask, cell_mask, config
             )
-            (
-                area_sig,
-                int_sig,
-                num_sig,
-                total_chromatin_area,
-                total_chromatin_intensity,
-            ) = measurements
-
 
             crop_stack = save_chromatin_crops(
-                                            cell, 
-                                            tophat_cell, 
-                                            cell_mask, 
-                                            labeled_chromosmes, 
-                                            removal_mask
-                                            )
+                cell,
+                tophat_cell,
+                cell_mask,
+                labeled_chromosomes,
+                removal_mask,
+            )
             visualization_stacks.append(crop_stack)
 
-        else:
-            area_sig, int_sig, num_sig = 0, 0, 0
-            total_chromatin_area, total_chromatin_intensity = 0, 0.0
+        # Append results directly (no zip later)
+        u_area_trace.append(u_area)
+        u_area_int_trace.append(u_area_int)
+        u_num_trace.append(u_num)
+        t_area_trace.append(t_area)
+        t_area_int_trace.append(t_area_int)
+        width_trace.append(width)
 
-        results.append(
-            (
-                area_sig,
-                int_sig,
-                total_chromatin_intensity,
-                num_sig,
-                total_chromatin_area,
-            )
-        )
-    
-    (
-        area_signal,
-        intensity_signal,
-        total_chromatin_intensity,
-        num_signals,
-        total_chromatin_area,
-    ) = zip(*results)
-
-    # Calculate metaphase plate removal metrics
-    num_removal_regions = 0
-    first_removal_frame = -1
-    last_removal_frame = -1
-
-    if successful_removal_frames:
-        successful_removal_frames.sort()
-        num_removal_frames = len(successful_removal_frames)
-        first_removal_frame = successful_removal_frames[0]
-        last_removal_frame = successful_removal_frames[-1]
-    else:
-        print(f"Cell {identity}: No metaphase plates were removed")
+    removal_freq = (
+        np.mean(successful_removal_frames)
+        if successful_removal_frames
+        else 0.0
+    )
 
     return (
-        list(area_signal),
-        list(intensity_signal),
-        list(total_chromatin_intensity),
-        list(num_signals),
-        list(total_chromatin_area),
-        num_removal_frames,
-        first_removal_frame,
-        last_removal_frame,
-        visualization_stacks
+        u_area_trace,
+        u_area_int_trace,
+        u_num_trace,
+        t_area_trace,
+        t_area_int_trace,
+        width_trace,
+        visualization_stacks,
+        removal_freq,
     )
 
 
@@ -742,7 +730,7 @@ def visualize_chromatin_processing(
 
     zoom_factor = adjust_zoom_factor(chromatin.shape, instance.shape)
 
-    print("frame_indices", frame_indices)
+    minors = []
     for row, frame_idx in enumerate(frame_indices):
         row_data = frames_data.iloc[frame_idx]
         f, l = (
@@ -758,22 +746,24 @@ def visualize_chromatin_processing(
         # Column 1: Original cell
         axes[row, 0].imshow(cell, cmap="gray")
         axes[row, 0].set_ylabel(f"Frame {f}", fontsize=10, fontweight="bold")
-        axes[row, 0].set_xticks([])
-        axes[row, 0].set_yticks([])
+        #axes[row, 0].set_xticks([])
+        #axes[row, 0].set_yticks([])
 
         # Column 2: Deconvolved
         axes[row, 1].imshow(deconv_cell, cmap="gray")
-        axes[row, 1].set_xticks([])
-        axes[row, 1].set_yticks([])
+        #axes[row, 1].set_xticks([])
+        #axes[row, 1].set_yticks([])
 
         # Column 3: Top-hat filtered
         axes[row, 2].imshow(tophat_cell, cmap="gray")
-        axes[row, 2].set_xticks([])
-        axes[row, 2].set_yticks([])
+        #axes[row, 2].set_xticks([])
+        #axes[row, 2].set_yticks([])
 
         # Column 4: Metaphase plate mask
-        removal_mask = determine_removal_mask(tophat_cell, cell, cell_mask, config)
+        removal_mask, width = determine_removal_mask(tophat_cell, cell, cell_mask, config)
         if removal_mask is not None:
+            minors.append(width)
+
             axes[row, 3].imshow(tophat_cell, cmap="gray")
 
             # Get the original region mask for comparison
@@ -865,10 +855,11 @@ def visualize_chromatin_processing(
             )
             axes[row, 4].set_xticks([])
             axes[row, 4].set_yticks([])
-
+    
     # Add overall title
+    avg_plt_width = np.nanmean(minors)
     fig.suptitle(
-        f"Chromatin Processing Pipeline - Cell {identity})",
+        f"Chromatin Processing Pipeline - Cell {identity}), 'Average plate width {avg_plt_width}",
         fontsize=16,
         fontweight="bold",
     )
@@ -884,6 +875,8 @@ def visualize_chromatin_processing(
         plt.show()
 
     plt.close()
+
+    return avg_plt_width
 
 
 if __name__ == "__main__":
@@ -926,64 +919,82 @@ if __name__ == "__main__":
         print("Chromatin paths", len(chromatin_paths))
         exit(1)
 
-    # Example: visualize processing for a random cell in the first position
-    if len(analysis_paths) > 0:
-        # Load data for the first position
-        analysis_df = pd.read_excel(analysis_paths[0])
-        instance = tiff.imread(instance_paths[0])
-        chromatin = tiff.imread(chromatin_paths[0])
 
-        # Clean the data
-        analysis_df.replace([np.inf, -np.inf], np.nan, inplace=True)
-        analysis_df.dropna(inplace=True)
-
-        # Get available cells
-        available_cells = analysis_df["particle"].unique()
-
-        if len(available_cells) > 0:
-            # Find cells with metaphase timepoints
-            cells_with_metaphase = []
-            for cell_id in available_cells:
-                metaphase_frames = analysis_df.query(
-                    f"particle == {cell_id} and semantic_smoothed == 1"
-                )
-                if len(metaphase_frames) > 0:
-                    cells_with_metaphase.append(cell_id)
-
-            if len(cells_with_metaphase) > 0:
-                # Randomly select a cell
-                cell_id = random.choice(cells_with_metaphase)
-                #cell_id = 43
-                metaphase_frames = analysis_df.query(
-                    f"particle == {cell_id} and semantic_smoothed == 1"
-                )
-
-                print(f"Randomly selected cell {cell_id} from position {positions[0]}")
-                print(f"Found {len(metaphase_frames)} metaphase timepoints")
-
-                # Create save path
-                save_dir = os.path.dirname(analysis_paths[0])
-                save_path = os.path.join(
-                    save_dir, f"{positions[0]}_cell_{cell_id}_processing.png"
-                )
-
-                config = ChromatinSegConfig() #this may be edited
-
-                # Run visualization
-                visualize_chromatin_processing(
-                    cell_id,
-                    analysis_df,
-                    instance,
-                    chromatin,
-                    n_rows=10,  # Show 10 metaphase timepoints
-                    config = config,
-                    save_path=save_path,
-                    figsize=(12, 16),
-                    dpi=150,
-                )
-            else:
-                print("No cells with metaphase timepoints found")
-        else:
-            print("No cells found in the analysis data")
-    else:
+    if len(analysis_paths) == 0:
         print("No data files found")
+        sys.exit()
+
+    # Load data for the first position
+    analysis_df = pd.read_excel(analysis_paths[0])
+    instance = tiff.imread(instance_paths[0])
+    chromatin = tiff.imread(chromatin_paths[0])
+
+    # Clean the data
+    analysis_df.replace([np.inf, -np.inf], np.nan, inplace=True)
+    analysis_df.dropna(inplace=True)
+
+    # Get available cells
+    available_cells = analysis_df["particle"].unique()
+
+    if len(available_cells) == 0:
+        print('No cells to analyze')
+        sys.exit()
+
+    valid_cells = []
+    for cell_id in available_cells:
+
+        intensity = analysis_df.query(f"particle=={cell_id}")["GFP"].to_numpy()
+        shading = analysis_df.query(f"particle=={cell_id}")["GFP_int_corr"].to_numpy()
+        offset = analysis_df.query(f"particle=={cell_id}")["offset"].to_numpy()
+        bkg = analysis_df.query(f"particle=={cell_id}")["GFP_bkg_corr"].to_numpy()
+        corr_intensity = ((intensity - bkg) * shading) - offset
+
+        peaks, range, hysteresis = validate_cyclin_b_trace(corr_intensity)
+        is_valid = peaks and range and hysteresis
+
+        metaphase_frames = analysis_df.query(
+            f"particle == {cell_id} and semantic_smoothed == 1"
+        )
+
+        if is_valid and len(metaphase_frames) > 4:
+            valid_cells.append(cell_id)
+    
+    if len(valid_cells) == 0:
+        print('No analyzable cells went through mitosis')
+        sys.exit(1)
+
+
+    means = []
+    for cell_id in valid_cells:
+
+        metaphase_frames = analysis_df.query(
+            f"particle == {cell_id} and semantic_smoothed == 1"
+        )
+
+        print(f"Working on cell {cell_id} from position {positions[0]}")
+        print(f"Found {len(metaphase_frames)} metaphase timepoints")
+
+        # Create save path
+        save_dir = os.path.dirname(analysis_paths[0])
+        save_path = os.path.join(
+            save_dir, f"{positions[0]}_cell_{cell_id}_processing.png"
+        )
+
+        config = ChromatinSegConfig(top_hat_radius = 15, truncate_z = 10e5) #this may be edited
+
+        # Run visualization
+        minor_mean = visualize_chromatin_processing(
+            cell_id,
+            analysis_df,
+            instance,
+            chromatin,
+            n_rows=10,  # Show 10 metaphase timepoints
+            config = config,
+            save_path=save_path,
+            figsize=(12, 16),
+            dpi=150,
+        )
+
+        means.append(minor_mean)
+
+    print(np.mean(means))

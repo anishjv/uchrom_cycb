@@ -43,9 +43,8 @@ def retrieve_traces(
     ids = []
     intensity_traces = []
     semantic_traces = []
-    first_tps = []
     frame_traces = []
-    last_tps = []
+    dead_traces = []
     t_char = 20 // frame_interval
 
     for id in analysis_df["particle"].unique():
@@ -55,11 +54,12 @@ def retrieve_traces(
         shading = analysis_df.query(f"particle=={id}")[f"{wl}_int_corr"].to_numpy()
         offset = analysis_df.query(f"particle=={id}")["offset"].to_numpy()
         frames = analysis_df.query(f"particle=={id}")["frame"].to_numpy()
+        dead = analysis_df.query(f"particle=={id}")["dead"].to_numpy()
 
         # Always remove traces that start in mitosis
         if semantic[0] == 1:
             continue
-        # 1) If remove_end_mitosis is True and the trace ends in mitosis at the final frame, skip
+        # If remove_end_mitosis is True and the trace ends in mitosis at the final frame, skip
         if remove_end_mitosis and semantic[-1] == 1:
             continue
 
@@ -71,18 +71,14 @@ def retrieve_traces(
         if props["widths"].size != 1:
             continue
 
-        first_mitosis = props["left_bases"][0]
-        last_mitosis = props["right_bases"][0]
-
         corr_intensity = ((intensity - bkg) * shading) - offset
         intensity_traces.append(corr_intensity)
         semantic_traces.append(semantic)
         frame_traces.append(frames)
-        first_tps.append(first_mitosis)
-        last_tps.append(last_mitosis)
+        dead_traces.append(dead)
         ids.append(id)
 
-    return intensity_traces, semantic_traces, ids, first_tps, frame_traces, last_tps
+    return intensity_traces, semantic_traces, frame_traces, dead_traces, ids
 
 
 def area_model(N, A_max, f, beta):
@@ -97,7 +93,7 @@ def predict_integer_chromosomes(
     beta: float,
     sigma_0: float,
     gamma:float,
-    max_n: int = 100
+    max_n: int = 75 #pseudo-triploid ~69
     ):
     """
     Defines a probability distribution over possible numbers of unaligned chromosomes 
@@ -181,22 +177,9 @@ def cycb_chromatin_batch_analyze(
         analysis_df.dropna(inplace=True)
 
         print(f"Working on position: {name_stub}")
-        intensity, semantic, ids, first_tps, frame_traces, last_mitotic_tps = (
+        intensity_traces, semantic_traces, frame_traces, dead_traces, ids = (
             retrieve_traces(analysis_df, "GFP", int(frame_interval_minutes))
         )
-
-        # Validate CyclinB traces and create validity mapping
-        valid_cells = {}
-        for i, trace in enumerate(intensity):
-            is_valid = validate_cyclin_b_trace(trace)
-            if is_valid:
-                valid_cells[ids[i]] = True
-            else:
-                valid_cells[ids[i]] = False
-        valid_count = sum(valid_cells.values())
-        invalid_count = len(valid_cells) - valid_count
-        
-        print(f"Position {name_stub}: {valid_count} valid cells retained, {invalid_count} invalid cells filtered out")
 
         # Initialize dataframe with empty lists for each column
         degradation_data = pd.DataFrame(
@@ -217,48 +200,71 @@ def cycb_chromatin_batch_analyze(
 
         # Store cell-level summary data
         cell_summary_data = []
-
         # Process each cell and extend the dataframe directly
         for i, cell_id in enumerate(ids):
-            # Skip if cell doesn't have a valid CyclinB trace
-            if valid_cells[cell_id] == False:
-                continue
+
+            # Frequecy of dead calls in mitosis
+            num_dead_flags = np.sum(semantic_traces[i]*dead_traces[i])
+            #semantic traces are boolean, np.sum is the number of timepoints in mitosis
+            #dead_freq = num_dead_flags / np.sum(semantic_traces[i]) 
+
+            # Validate that intensity trace is a Cyclin B trace based on three criterion
+            peaks, range, hysteresis = validate_cyclin_b_trace(intensity_traces[i])
                 
             # Get chromatin segmentation data for this cell
             data_tuple = unaligned_chromatin(
                 cell_id, analysis_df, instance, chromatin, config=config
             )
 
-            u_chromatin_area = data_tuple[0]
-            u_chrom_num, (u_chrom_num_low, u_chrom_num_high), _ = predict_integer_chromosomes(
-                u_chromatin_area,
-                1050.85,
-                0.0468,
-                79.11,
-                66.87,
-                0.160
-            )
-            visualization_stacks = data_tuple[8]
-
             if data_tuple is None:
-                continue
+                continue #skip the cell
+
+            (
+                u_area_trace, 
+                u_area_int_trace, 
+                u_num_trace, 
+                t_area_trace, 
+                t_area_int_trace, 
+                width_trace,
+                visualization_stacks, 
+                removal_freq 
+                ) = data_tuple
+
+
+            # New: for predicting chromosome number from chromosome areas
+            u_num_trace = []
+            u_num_low_trace = []
+            u_num_high_trace = []
+            for meas in u_area_trace:
+                meas *= 0.3387**2 #conversion to square microns
+                u_num, (u_num_low, u_num_high), _ = predict_integer_chromosomes(
+                    meas,
+                    123.83,
+                    0.043,
+                    13.57,
+                    12.62,
+                    0.0091
+                )
+                u_num_trace.append(u_num)
+                u_num_low_trace.append(u_num_low)
+                u_num_high_trace.append(u_num_high)
 
             # Get the actual frames for this cell
             frames = frame_traces[i]
-
             # Create data for this cell
             cell_data = {
                 "cell_id": [cell_id] * len(frames),
                 "frame": frames,
-                "cycb_intensity": intensity[i],
-                "semantic": semantic[i],
-                "u_chromatin_area": data_tuple[0],
-                "u_chromatin_intensity": data_tuple[1],
-                "t_chromatin_area": data_tuple[4],
-                "t_chromatin_intensity": data_tuple[2],
-                "u_chrom_num": u_chrom_num,
-                "u_chrom_num_low": u_chrom_num_low,
-                "u_chrom_num_high": u_chrom_num_high,
+                "cycb_intensity": intensity_traces[i],
+                "semantic_smoothed": semantic_traces[i],
+                "u_area": u_area_trace,
+                "u_area_intintensity": u_area_int_trace,
+                "t_chromatin_area": t_area_trace,
+                "t_chromatin_intensity": t_area_int_trace,
+                "mtphs_plate_width": width_trace,
+                "u_chrom_num": u_num_trace,
+                "u_chrom_num_low": u_num_low_trace,
+                "u_chrom_num_high": u_num_high_trace,
 
             }
 
@@ -271,14 +277,14 @@ def cycb_chromatin_batch_analyze(
             cell_summary_data.append(
                 {
                     "cell_id": cell_id,
-                    "first_mitosis": first_tps[i],
-                    "last_mitosis": last_mitotic_tps[i],
-                    "n_frames": len(frames),
-                    "frame_start": frames[0],
-                    "frame_end": frames[-1],
-                    "num_removal_frames": data_tuple[5],
-                    "first_removal_frame": data_tuple[6],
-                    "last_removal_frame": data_tuple[7],
+                    "track_len": len(frames),
+                    "track_start": frames[0],
+                    "track_end": frames[-1],
+                    "plate_removal_freq": removal_freq,
+                    "num_dead_flags": num_dead_flags,
+                    "peaks_criterion": peaks,
+                    "range_criterion": range,
+                    "hysteresis_criterion": hysteresis
                 }
             )
 
@@ -289,16 +295,6 @@ def cycb_chromatin_batch_analyze(
                     for j, img in enumerate(stack):   # for each image in each stack
                         grp.create_dataset(f'{j}', data=img, compression="gzip")
 
-        print(f"Created long-format dataframe with {len(degradation_data)} rows")
-        print(
-            f"Data format: {len(ids)} cells × {degradation_data['frame'].nunique()} unique frames"
-        )
-        print(
-            f"Frame range: {degradation_data['frame'].min()} to {degradation_data['frame'].max()}"
-        )
-        print(
-            f"Excel file contains: degradation_data, cell_summary, and analysis_config sheets"
-        )
 
         # Create cell summary dataframe
         cell_summary_df = pd.DataFrame(cell_summary_data)
@@ -327,7 +323,7 @@ def cycb_chromatin_batch_analyze(
         else:
             analysis_config_df = analysis_info
 
-        save_path = os.path.join(save_dir, f"{name_stub}cycb_chromatin.xlsx")
+        save_path = os.path.join(save_dir, f"{name_stub}_cycb_chromatin.xlsx")
         with pd.ExcelWriter(save_path, engine="openpyxl") as writer:
             # Save main data in long format (similar to cellaap_analysis.py)
             # Each row represents a (cell_id, frame) combination with all attributes as columns
