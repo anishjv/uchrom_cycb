@@ -133,6 +133,7 @@ def cycb_chromatin_batch_analyze(
     chromatin_paths: list,
     frame_interval_minutes: float = 4.0,
     config: Optional[object] = None,
+    version: Optional[str] = None
 ) -> tuple[pd.DataFrame]:
     """
     Batch analyze chromatin segmentation for multiple positions.
@@ -323,6 +324,8 @@ def cycb_chromatin_batch_analyze(
         else:
             analysis_config_df = analysis_info
 
+        if version:
+            name_stub += f'_{version}'
         save_path = os.path.join(save_dir, f"{name_stub}_cycb_chromatin.xlsx")
         with pd.ExcelWriter(save_path, engine="openpyxl") as writer:
             # Save main data in long format (similar to cellaap_analysis.py)
@@ -343,7 +346,8 @@ def cycb_chromatin_batch_analyze(
 
 if __name__ == "__main__":
 
-    root_dir = Path("/nfs/turbo/umms-ajitj/anishjv/cyclinb_analysis/20250621-cycb-noc/")
+    version = '0.3'
+    root_dir = Path("/nfs/turbo/umms-ajitj/anishjv/cyclinb_analysis/20250621-cycb-noc")
     inference_dirs = [
         obj.path
         for obj in os.scandir(root_dir)
@@ -358,13 +362,12 @@ if __name__ == "__main__":
             r"[A-H]([1-9]|[0][1-9]|[1][0-2])_s(\d{2}|\d{1})", str(dir)
         ).group()
         name_stub = str(name_stub) #temporary (removed + '-')
-        an_paths_t = glob.glob(f"{dir}/*analysis.xlsx")
-        an_paths = [f for f in an_paths_t if '_analysis.xlsx' not in f] #temporary
+        an_paths = glob.glob(f"{dir}/*analysis.xlsx")
         inst_paths = glob.glob(f"{dir}/*instance_movie.tif")
         chrom_paths = [
             path
             for path in glob.glob(f"{root_dir}/*Texas Red.tif")
-            if str(name_stub) in path
+            if str(name_stub + '_') in path
         ]
         analysis_paths += an_paths
         instance_paths += inst_paths
@@ -383,7 +386,7 @@ if __name__ == "__main__":
     # Use default configuration
     cycb_chromatin_batch_analyze(
         positions, analysis_paths, instance_paths, chromatin_paths,
-        frame_interval_minutes=4.0
+        frame_interval_minutes=4.0, version=version
     )
 
     """
