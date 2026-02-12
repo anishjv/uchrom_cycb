@@ -54,7 +54,7 @@ def retrieve_traces(
         shading = analysis_df.query(f"particle=={id}")[f"{wl}_int_corr"].to_numpy()
         offset = analysis_df.query(f"particle=={id}")["offset"].to_numpy()
         frames = analysis_df.query(f"particle=={id}")["frame"].to_numpy()
-        dead = analysis_df.query(f"particle=={id}")["dead"].to_numpy()
+        dead = analysis_df.query(f"particle=={id}")["dead_flag"].to_numpy()
 
         # Always remove traces that start in mitosis
         if semantic[0] == 1:
@@ -188,14 +188,15 @@ def cycb_chromatin_batch_analyze(
                 "cell_id": [],
                 "frame": [],
                 "cycb_intensity": [],
-                "semantic": [],
-                "u_chromatin_area": [],
-                "u_chromatin_intensity": [],
-                "t_chromatin_intensity": [],
-                "t_chromatin_area": [],
+                "semantic_smoothed": [],
+                "u_area": [],
+                "u_area_intensity": [],
+                "t_area": [],
+                "t_area_intensity": [],
+                "mtphs_plate_width": [],
                 "u_chrom_num": [],
                 "u_chrom_num_low": [],
-                "u_chrom_num_high": []
+                "u_chrom_num_high": [],
             }
         )
 
@@ -259,14 +260,13 @@ def cycb_chromatin_batch_analyze(
                 "cycb_intensity": intensity_traces[i],
                 "semantic_smoothed": semantic_traces[i],
                 "u_area": u_area_trace,
-                "u_area_intintensity": u_area_int_trace,
-                "t_chromatin_area": t_area_trace,
-                "t_chromatin_intensity": t_area_int_trace,
+                "u_area_intensity": u_area_int_trace,
+                "t_area": t_area_trace,
+                "t_area_intensity": t_area_int_trace,
                 "mtphs_plate_width": width_trace,
                 "u_chrom_num": u_num_trace,
                 "u_chrom_num_low": u_num_low_trace,
                 "u_chrom_num_high": u_num_high_trace,
-
             }
 
             # Extend the dataframe with this cell's data

@@ -351,16 +351,20 @@ def validate_cyclin_b_trace(trace: np.ndarray):
 
     # Criterion 3: Check left base > right base for main (tallest) peak
     # Find the tallest peak (highest prominence)
-    prominences = properties["prominences"]
-    tallest_peak_idx = np.argmax(prominences)
+    if peaks_criterion:
+        prominences = properties["prominences"]
+        tallest_peak_idx = np.argmax(prominences)
 
-    # Get left and right bases for the tallest peak
-    left_bases = properties["left_bases"]
-    right_bases = properties["right_bases"]
+        # Get left and right bases for the tallest peak
+        left_bases = properties["left_bases"]
+        right_bases = properties["right_bases"]
 
-    left_base_value = trace[left_bases[tallest_peak_idx]]
-    right_base_value = trace[right_bases[tallest_peak_idx]]
+        left_base_value = trace[left_bases[tallest_peak_idx]]
+        right_base_value = trace[right_bases[tallest_peak_idx]]
 
-    hysterisis_criterion = True if left_base_value > right_base_value else False
+        hysterisis_criterion = True if left_base_value > right_base_value else False
+    
+    else:
+        hysterisis_criterion = False
 
     return peaks_criterion, range_criterion, hysterisis_criterion
