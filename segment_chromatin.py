@@ -849,7 +849,6 @@ def visualize_chromatin_processing(
 
     plt.close()
 
-    return avg_plt_width
 
 
 if __name__ == "__main__":
@@ -920,24 +919,24 @@ if __name__ == "__main__":
         shading = analysis_df.query(f"particle=={cell_id}")["GFP_int_corr"].to_numpy()
         offset = analysis_df.query(f"particle=={cell_id}")["offset"].to_numpy()
         bkg = analysis_df.query(f"particle=={cell_id}")["GFP_bkg_corr"].to_numpy()
+        dead = analysis_df.query(f"particle=={cell_id}")["dead_flag"].to_numpy()
+        semantic_smoothed = analysis_df.query(f"particle=={cell_id}")["semantic_smoothed"].to_numpy()
+        dead_score = np.sum(semantic_smoothed * dead)
         corr_intensity = ((intensity - bkg) * shading) - offset
 
-        peaks, range, hysteresis = validate_cyclin_b_trace(corr_intensity)
-        is_valid = peaks and range and hysteresis
+        _, range_crit, _ = validate_cyclin_b_trace(corr_intensity)
 
         metaphase_frames = analysis_df.query(
             f"particle == {cell_id} and semantic_smoothed == 1"
         )
 
-        if is_valid and len(metaphase_frames) > 4:
+        valid = range_crit and dead_score <= 5 and np.sum(semantic_smoothed) >=5
+
+        if valid:
             valid_cells.append(cell_id)
     
-    if len(valid_cells) == 0:
-        print('No analyzable cells went through mitosis')
-        sys.exit(1)
 
-
-    means = []
+    print(f'Will visualize {len(valid_cells)} cells')
     for cell_id in valid_cells:
 
         metaphase_frames = analysis_df.query(
@@ -956,7 +955,7 @@ if __name__ == "__main__":
         config = ChromatinSegConfig(top_hat_radius = 15, truncate_z = 10e5) #this may be edited
 
         # Run visualization
-        minor_mean = visualize_chromatin_processing(
+        visualize_chromatin_processing(
             cell_id,
             analysis_df,
             instance,
@@ -967,7 +966,3 @@ if __name__ == "__main__":
             figsize=(12, 16),
             dpi=150,
         )
-
-        means.append(minor_mean)
-
-    print(np.mean(means))

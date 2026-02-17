@@ -241,11 +241,11 @@ def cycb_chromatin_batch_analyze(
                 meas *= 0.3387**2 #conversion to square microns
                 u_num, (u_num_low, u_num_high), _ = predict_integer_chromosomes(
                     meas,
-                    123.83,
-                    0.043,
-                    13.57,
-                    12.62,
-                    0.0091
+                    152.56,
+                    0.034,
+                    13.64,
+                    14.06,
+                    -0.091
                 )
                 u_num_trace.append(u_num)
                 u_num_low_trace.append(u_num_low)
