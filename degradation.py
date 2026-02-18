@@ -205,12 +205,12 @@ def cycb_chromatin_batch_analyze(
         # Process each cell and extend the dataframe directly
         for i, cell_id in enumerate(ids):
 
-            # Frequecy of dead calls in mitosis
+            # Computing some important per-cell statistics
+            #   1. Number of dead calls during mitosis
+            #   2. Time spent in mitosis
+            #   3. Heuristic Cyclin B validation
             num_dead_flags = np.sum(semantic_traces[i]*dead_traces[i])
-            #semantic traces are boolean, np.sum is the number of timepoints in mitosis
-            #dead_freq = num_dead_flags / np.sum(semantic_traces[i]) 
-
-            # Validate that intensity trace is a Cyclin B trace based on three criterion
+            time_in_mitosis = np.sum(semantic_traces[i])
             peaks, range, hysteresis = validate_cyclin_b_trace(intensity_traces[i])
                 
             # Get chromatin segmentation data for this cell
@@ -261,6 +261,8 @@ def cycb_chromatin_batch_analyze(
                 "semantic_smoothed": semantic_traces[i],
                 "u_area": u_area_trace,
                 "u_area_intensity": u_area_int_trace,
+                "a_area": (t_area_trace - u_area_trace),
+                "a_area_intensity": (t_area_int_trace - u_area_int_trace),
                 "t_area": t_area_trace,
                 "t_area_intensity": t_area_int_trace,
                 "mtphs_plate_width": width_trace,
@@ -285,7 +287,8 @@ def cycb_chromatin_batch_analyze(
                     "num_dead_flags": num_dead_flags,
                     "peaks_criterion": peaks,
                     "range_criterion": range,
-                    "hysteresis_criterion": hysteresis
+                    "hysteresis_criterion": hysteresis,
+                    "time_in_mitosis": time_in_mitosis
                 }
             )
 

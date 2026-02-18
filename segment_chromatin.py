@@ -222,7 +222,7 @@ def determine_removal_mask(
 
     removal_mask = remove_metaphase_plate(max_lbl, labeled_regions, cell, config)
     props = regionprops(label(removal_mask))
-    width = props[0].axis_minor_length if len(props)>0 else np.nan
+    width = props[0].axis_minor_length if len(props)>0 else 0.0
 
     return removal_mask, width
 
