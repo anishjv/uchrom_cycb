@@ -1,342 +1,127 @@
-from cmath import phase
 import pandas as pd
 import numpy as np
 from typing import Optional, List, Union
-from skimage.restoration import denoise_tv_chambolle
-from changept import *
 import re
 import h5py
-from matplotlib.colors import to_rgba
+import matplotlib.pyplot as plt
+import math
+import sys
+sys.path.append('/Users/whoisv/')
+from uchrom_cycb.changept import changept
 
+def aggregate_clean_dfs(
+    paths: list[str], 
+    datewell_keep: Optional[list[str]]=None
+    ) -> tuple[pd.DataFrame]:
 
-def smooth_cycb_chromatin(
-    chromatin_df: pd.DataFrame,
-    weight: Optional[int] = 12,
-):
-    """
-    Smooths cyclin B and chromatin traces; computes derivative of signal
-    ----------------------------------------------------------------------------------
+    '''
+    Aggregates chromatin.xlsx dataframes
+    --------------------------------------
     INPUTS:
-        chromatin_df: pandas dataframe containing relevant information
-        weight: weight to be used in TV denoising
+        paths: list[str], list of paths to chromatin.xlsx files
+        datewell_keep[str], datewells to aggregate
     OUTPUTS:
-        traces: list containing cyclinb traces
-        smooth_traces: list containing smoothed cyclinb traces
-        derivatives: list containing computed derivative traces
-        uchromatin_traces: list containing euchromatin area traces
-        achromatin_traces: list containing heterochromatin area traces
-        semantic_traces: list containing semantic labels per cell
-    """
 
-    traces = []
-    smooth_traces = []
-    derivatives = []
-    uchromatin_traces = []
-    achromatin_traces = []
-    semantic_traces = []
-    id_traces = []
-    frame_traces = []
-    uchrom_nums = []
+    '''
 
-    for id in chromatin_df["cell_id"].unique():
-        trace = chromatin_df.query(f"cell_id=={id}")["cycb_intensity"].to_numpy()
-        uchromatin = chromatin_df.query(f"cell_id=={id}")["u_chromatin_area"].to_numpy()
-        tchromatin = chromatin_df.query(f"cell_id=={id}")["t_chromatin_area"].to_numpy()
-        achromatin = tchromatin - uchromatin
-        semantic = chromatin_df.query(f"cell_id=={id}")["semantic"].to_numpy()
-        frames = chromatin_df.query(f"cell_id=={id}")["frame"].to_numpy()
-        ids = chromatin_df.query(f"cell_id=={id}")["cell_id"].to_numpy()
-        uchrom_num = chromatin_df.query(f"cell_id=={id}")[
-            "num_u_chromosomes"
-        ].to_numpy()
+    dfs = []
+    qc_dfs = []
+    failed_records = []
 
-        smooth_trace = denoise_tv_chambolle(trace, weight=weight)
-        first_deriv = np.gradient(smooth_trace)
+    for f in paths:
 
-        traces.append(trace)
-        smooth_traces.append(smooth_trace)
-        derivatives.append(first_deriv)
-        uchromatin_traces.append(uchromatin)
-        achromatin_traces.append(achromatin)
-        semantic_traces.append(semantic)
-        id_traces.append(ids)
-        frame_traces.append(frames)
-        uchrom_nums.append(uchrom_num)
+        date = re.search(r"20\d{2}(0[1-9]|1[0-2])(0[1-9]|[12][0-9]|3[01])", str(f)).group()
+        well = re.search(r"[A-H]([1-9]|0[1-9]|1[0-2])_s(\d{1,2})", str(f)).group()
 
-    return (
-        traces,
-        smooth_traces,
-        derivatives,
-        uchromatin_traces,
-        achromatin_traces,
-        semantic_traces,
-        id_traces,
-        frame_traces,
-        uchrom_nums,
-    )
-
-
-def unpack_cycb_chromatin(
-    traces: list,
-    derivatives: list,
-    semantics: list,
-    uchromatin_traces: list,
-    achromatin_traces: list,
-    changepts: list,
-    id_traces: list,
-    frame_traces: list,
-    uchrom_nums: list,
-    use_changept: Optional[bool] = True,
-    remove_end_mitosis: Optional[bool] = True,
-):
-    """
-    Unpacks per-timepoint features around mitosis for downstream comparison and modeling
-    ------------------------------------------------------
-    INPUTS:
-        traces: list, smoothed Cyclin B intensity traces per cell
-        derivatives: list, first derivatives of smoothed Cyclin B traces per cell
-        semantics: list, per-timepoint semantic labels (1 indicates mitosis) per cell
-        uchromatin_traces: list, euchromatin area traces per cell
-        achromatin_traces: list, heterochromatin area traces per cell
-        changepts: list, detected changepoint indices per cell (np.nan if unavailable)
-        id_traces: list, cell ID traces per cell
-        frame_traces: list, frame number traces per cell
-        uchrom_nums: list, number of unaligned chromosomes (estimate) per cell
-        use_changept: Optional[bool], whether or not to compute changepoints
-        remove_end_mitosis: Optional[bool], skip cells ending the movie in mitosis when True
-    OUTPUTS:
-        unpacked_smooth_cycb: list[float], per-timepoint Cyclin B values within mitosis window
-        unpacked_dcycb_dt: list[float], per-timepoint degradation rates (negative derivative)
-        unpacked_uchromatin_area: list[float], per-timepoint euchromatin area within mitosis
-        unpacked_achromatin_area: list[float], per-timepoint heterochromatin area within mitosis
-        unpacked_pos_in_mitosis: list[float], normalized position in mitosis [0,1]
-        phase_flag: list[str], label 'slow' before changepoint and 'fast' after
-        min_after_changept: list[float], minutes relative to changepoint (scaled as 4*(t - cp))
-        unpacked_tracking_ids: list[int], per-timepoint cell IDs within mitosis window
-        unpacked_frames: list[int], per-timepoint frame numbers within mitosis window
-        unpacked_uchrom_nums: list[int], per-timepoint number of unaligned chromosomes
-    """
-
-    unpacked_smooth_cycb = []
-    unpacked_dcycb_dt = []
-    unpacked_uchromatin_area = []
-    unpacked_achromatin_area = []
-    unpacked_pos_in_mitosis = []
-    phase_flag = []
-    min_after_changept = []
-    unpacked_tracking_ids = []
-    unpacked_frames = []
-    unpacked_uchrom_nums = []
-
-    num_traces = len(traces)
-
-    for j in range(num_traces):
-        cell_trace = traces[j]
-        semantic = semantics[j]
-        deg_rate = -1 * derivatives[j]
-        uchromatin = uchromatin_traces[j]
-        achromatin = achromatin_traces[j]
-        tracking_ids = id_traces[j]
-        frames = frame_traces[j]
-        uchrom_n = uchrom_nums[j]
-        changept = changepts[j]
-
-        # Skip if changept is required but invalid
-        if use_changept and np.isnan(changept):
-            continue
-
-        # Skip if last frame is mitosis
-        if remove_end_mitosis and semantic[-1] == 1:
-            continue
-
-        mitotic_indices = np.where(semantic == 1)[0]
-        cycb_in_mitosis = cell_trace[semantic == 1]
-        max_cycb = np.argmax(cycb_in_mitosis)
-        low_bound = mitotic_indices[max_cycb]
-        t_min = min(mitotic_indices)
-        t_max = max(mitotic_indices)
-
-        # If not using changepoints, the "changept" is simply the end of mitosis
-        if not use_changept:
-            changept = t_max
-
-        for t, val in enumerate(cell_trace):
-
-            if t < t_min:
-                flag = "before mitosis"
-            elif t_min <= t < low_bound:
-                flag = 'no deg'
-            elif low_bound <= t < changept:
-                flag = 'slow'
-            elif changept <= t < t_max:
-                flag = 'fast'
-            else:
-                flag = "after mitosis"
-
-            # Append unpacked variables
-            min_after_changept.append(4 * (t - changept))
-            unpacked_smooth_cycb.append(val)
-            unpacked_dcycb_dt.append(deg_rate[t])
-            unpacked_uchromatin_area.append(uchromatin[t])
-            unpacked_achromatin_area.append(achromatin[t])
-            unpacked_pos_in_mitosis.append((t - t_min) / (t_max - t_min))
-            phase_flag.append(flag)
-            unpacked_tracking_ids.append(tracking_ids[t])
-            unpacked_frames.append(frames[t])
-            unpacked_uchrom_nums.append(uchrom_n[t])
-
-    return (
-        unpacked_smooth_cycb,
-        unpacked_dcycb_dt,
-        unpacked_uchromatin_area,
-        unpacked_achromatin_area,
-        unpacked_pos_in_mitosis,
-        phase_flag,
-        min_after_changept,
-        unpacked_tracking_ids,
-        unpacked_frames,
-        unpacked_uchrom_nums,
-    )
-
-
-def create_aggregate_df(
-    paths: list[str],
-    remove_end_mitosis: bool = True,
-    use_changept: Union[bool, list[bool]] = True,
-):
-    """
-    Creates an aggregated DataFrame from multiple Excel files of chromatin analysis outputs
-    ------------------------------------------------------------------------------------------------------
-    INPUTS:
-        paths: list[str], file paths to Excel files containing chromatin analysis data
-        remove_end_mitosis: Optional[bool], skip cells ending the movie in mitosis when True
-        use_changept: Optional[bool], whether or not to compute changepoints
-    OUTPUTS:
-        df: pd.DataFrame, aggregated rows with columns ['cycb', 'deg_rate', 'uchromatin', 'achromatin', 'pos_in_mitosis', 'phase_flag', 'min_after_changept', 'tracking_id', 'frame', 'date-well']
-    """
-
-    # If scalar, broadcast to all paths
-    if isinstance(use_changept, bool):
-        use_changept_list = [use_changept] * len(paths)
-    else:
-        assert len(use_changept) == len(
-            paths
-        ), "`use_changept` list must match length of `paths`."
-        use_changept_list = use_changept
-
-    usc_cont = []
-    udd_cont = []
-    uca_cont = []
-    ucn_cont = []
-    aca_cont = []
-    upm_cont = []
-    date_well_cont = []
-    pf_cont = []
-    mac_cont = []
-    tracking_id_cont = []
-    frame_cont = []
-    pos_cont = []
-
-    for path, use_cp_this_file in zip(paths, use_changept_list):
-
-        chromatin_df = pd.read_excel(path)
-        (
-            _,
-            smooth_traces,
-            derivatives,
-            uchromatin,
-            achromatin,
-            semantics,
-            id_traces,
-            frame_traces,
-            uchrom_nums,
-        ) = smooth_cycb_chromatin(chromatin_df, weight=5)
-
-        # --- VALIDATION + CHANGEPOINT LOGIC ---------------------------
-        valids = [validate_cyclin_b_trace(cycb) for cycb in smooth_traces]
-
-        changepts = []
-        for is_valid, cycb, deg, sem in zip(
-            valids, smooth_traces, derivatives, semantics
-        ):
-
-            # If fails validate() → trace must be excluded
-            if not is_valid:
-                changepts.append(np.nan)
+        if datewell_keep:
+            if not any(stub in date + well[0] for stub in datewell_keep):
                 continue
 
-            if use_cp_this_file:
-                cp = peaks_changept(cycb, deg, sem)
-                changepts.append(cp if not np.isnan(cp) else np.nan)
-            else:
-                # placeholder; real CP assigned in unpack()
-                changepts.append(0)
+        print(f"Aggregating {date}, {well}")
 
-        # --- UNPACK ----------------------------------------------------
-        (
-            unpacked_smooth_cycb,
-            unpacked_dcycb_dt,
-            unpacked_uchromatin_area,
-            unpacked_achromatin_area,
-            unpacked_pos_in_mitosis,
-            phase_flag,
-            min_after_changept,
-            unpacked_tracking_ids,
-            unpacked_frames,
-            unpacked_uchrom_num,
-        ) = unpack_cycb_chromatin(
-            smooth_traces,
-            derivatives,
-            semantics,
-            uchromatin,
-            achromatin,
-            changepts,
-            id_traces,
-            frame_traces,
-            uchrom_nums,
-            use_changept=use_cp_this_file,
-            remove_end_mitosis=remove_end_mitosis,
+        df = pd.read_excel(f)
+        df_qc = pd.read_excel(f, sheet_name=1)
+
+        df["date"] = date
+        df["well"] = well
+        df["date-well"] = df["date"] + df["well"].str[0]
+
+        dfs.append(df)
+
+        qc_mask = (
+            (df_qc["num_dead_flags"] <= 5) &
+            (df_qc["plate_removal_freq"] >= 0.5) &
+            (df_qc["range_criterion"].astype(int) == 1)
         )
 
-        # --- ACCUMULATE -------------------------------------------------
-        usc_cont += unpacked_smooth_cycb
-        udd_cont += unpacked_dcycb_dt
-        uca_cont += unpacked_uchromatin_area
-        ucn_cont += unpacked_uchrom_num
-        aca_cont += unpacked_achromatin_area
-        upm_cont += unpacked_pos_in_mitosis
-        pf_cont += phase_flag
-        mac_cont += min_after_changept
-        tracking_id_cont += unpacked_tracking_ids
-        frame_cont += unpacked_frames
+        # keep only PASSING rows
+        qc_dfs.append(df_qc.loc[qc_mask].copy())
 
-        well = re.search(r"[A-H]([1-9]|0[1-9]|1[0-2])_s(\d{1,2})", str(path)).group()
-        date = re.search(
-            r"20\d{2}(0[1-9]|1[0-2])(0[1-9]|[12][0-9]|3[01])", str(path)
-        ).group()
-        date_well_cont += [date + "-" + well[0]] * len(unpacked_smooth_cycb)
+        failed_rows = df_qc.loc[~qc_mask, ["cell_id"]].copy()
+        failed_rows["date"] = date
+        failed_rows["well"] = well
+        failed_records.append(failed_rows)
 
-        pos = well.split("_")[-1]
-        pos_cont += [pos] * len(unpacked_smooth_cycb)
+    df_agg = pd.concat(dfs, ignore_index=True)
+    df_agg_qc = pd.concat(qc_dfs, ignore_index=True)
+    df_failed = pd.concat(failed_records, ignore_index=True)
 
-    df = pd.DataFrame(
-        {
-            "cycb": usc_cont,
-            "deg_rate": udd_cont,
-            "uchromatin": uca_cont,
-            "uchromatin_num": ucn_cont,
-            "achromatin": aca_cont,
-            "pos_in_mitosis": upm_cont,
-            "phase_flag": pf_cont,
-            "min_after_changept": mac_cont,
-            "tracking_id": tracking_id_cont,
-            "frame": frame_cont,
-            "date-well": date_well_cont,
-            "position": pos_cont,
-        }
+    failed_index = pd.MultiIndex.from_frame(df_failed[["cell_id", "date", "well"]])
+    agg_index = pd.MultiIndex.from_frame(df_agg[["cell_id", "date", "well"]])
+
+    df_agg_c = df_agg[~agg_index.isin(failed_index)]
+
+    return df_agg_c, df_agg_qc
+
+
+def find_slowdeg_regime(group: pd.DataFrame):
+
+    '''
+    Appends two rows ('slowdeg_regime', 'regime_time') to the 
+    aggregate dataframe from aggregate_clean_dfs()
+    ---------------------------------------------------------
+    INPUTS:
+        group: pd.DataFrame, grouped dataframe
+    '''
+
+    group = group.sort_values("frame")
+
+    mask = group["semantic_smoothed"] == 1
+    y = group.loc[mask, "cycb_intensity"]
+
+    slowdeg_regime = pd.Series(0, index=group.index, dtype=int)
+    regime_time = pd.Series(np.nan, index=group.index, dtype=float)
+
+    if len(y) < 3:
+        return pd.DataFrame({
+            "slowdeg_regime": slowdeg_regime,
+            "regime_time": regime_time
+        })
+
+    cp, i_max, i_min = changept(y.to_numpy())
+
+    frames = group.loc[mask, "frame"].to_numpy()
+
+    cp_frame  = frames[cp]
+    max_frame = frames[i_max]
+
+    start = min(cp_frame, max_frame)
+    end   = max(cp_frame, max_frame)
+
+    in_regime = (
+        (group["frame"] >= start) &
+        (group["frame"] <= end)
     )
 
-    return df
+    slowdeg_regime.loc[in_regime] = 1
+
+    # count frames since regime start
+    regime_time.loc[in_regime] = group.loc[in_regime, "frame"] - start
+
+    return pd.DataFrame({
+        "slowdeg_regime": slowdeg_regime,
+        "regime_time": regime_time
+    })
 
 
 def save_chromatin_crops(
@@ -362,7 +147,7 @@ def save_chromatin_crops(
             [2] colored overlay of unaligned chromosomes + cell mask (RGBA)
     """
 
-    from segment_chromatin import get_largest_signal_regions
+    from uchrom_cycb.segment_chromatin import get_largest_signal_regions
 
     H, W = cell.shape
     raw_img = cell.copy()  # raw grayscale base

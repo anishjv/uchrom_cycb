@@ -16,15 +16,17 @@ import matplotlib.pyplot as plt
 from dataclasses import dataclass
 from scipy.special import j1
 import cv2
-from extractRect import findRotMaxRect
 import os
 from pathlib import Path
 import glob
 import re
 import tifffile as tiff
-from deg_analysis import save_chromatin_crops
-from changept import validate_cyclin_b_trace
+
 import sys
+sys.path.append('/Users/whoisv/')
+from uchrom_cycb.deg_analysis import save_chromatin_crops
+from uchrom_cycb.changept import validate_cyclin_b_trace
+from uchrom_cycb.extractRect import findRotMaxRect
 
 @dataclass
 class ChromatinSegConfig:
