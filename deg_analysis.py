@@ -11,7 +11,8 @@ from uchrom_cycb.changept import changept
 
 def aggregate_clean_dfs(
     paths: list[str], 
-    datewell_keep: Optional[list[str]]=None
+    datewell_keep: Optional[list[str]]=None,
+    pos_avoid: Optional[list[str]]=None
     ) -> tuple[pd.DataFrame]:
 
     '''
@@ -33,8 +34,12 @@ def aggregate_clean_dfs(
         date = re.search(r"20\d{2}(0[1-9]|1[0-2])(0[1-9]|[12][0-9]|3[01])", str(f)).group()
         well = re.search(r"[A-H]([1-9]|0[1-9]|1[0-2])_s(\d{1,2})", str(f)).group()
 
-        if datewell_keep:
+        if datewell_keep: #keep certain wells
             if not any(stub in date + well[0] for stub in datewell_keep):
+                continue
+
+        if pos_avoid: #avoid certain positions
+            if any(stub in (date + '_' + well) for stub in pos_avoid):
                 continue
 
         print(f"Aggregating {date}, {well}")
@@ -45,6 +50,10 @@ def aggregate_clean_dfs(
         df["date"] = date
         df["well"] = well
         df["date-well"] = df["date"] + df["well"].str[0]
+
+        df_qc["date"] = date
+        df_qc["well"] = well
+        df_qc["date-well"] = df["date"] + df["well"].str[0]
 
         dfs.append(df)
 
