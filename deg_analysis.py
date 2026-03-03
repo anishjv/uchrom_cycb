@@ -7,12 +7,14 @@ import matplotlib.pyplot as plt
 import math
 import sys
 sys.path.append('/Users/whoisv/')
-from uchrom_cycb.changept import changept
+from uchrom_cycb.changept import deriv_changept
+from scipy.ndimage import binary_dilation
 
 def aggregate_clean_dfs(
     paths: list[str], 
     datewell_keep: Optional[list[str]]=None,
-    pos_avoid: Optional[list[str]]=None
+    pos_avoid: Optional[list[str]]=None,
+    filters: Optional[list[str]]=None
     ) -> tuple[pd.DataFrame]:
 
     '''
@@ -53,15 +55,37 @@ def aggregate_clean_dfs(
 
         df_qc["date"] = date
         df_qc["well"] = well
-        df_qc["date-well"] = df["date"] + df["well"].str[0]
-
+        df_qc["date-well"] = df_qc["date"] + df_qc["well"].str[0]
         dfs.append(df)
 
-        qc_mask = (
-            (df_qc["num_dead_flags"] <= 5) &
-            (df_qc["plate_removal_freq"] >= 0.5) &
-            (df_qc["range_criterion"].astype(int) == 1)
+        #TODO: integrate exited mitosis flag in degradation.py
+        ends_in_mitosis = (
+            df
+            .sort_values(["cell_id", "frame"])
+            .groupby("cell_id")["semantic_smoothed"]
+            .last()
+            .eq(1)
         )
+
+        df_qc["ends_in_mitosis"] = df_qc["cell_id"].map(ends_in_mitosis).fillna(False)
+
+        QC_RULES = {
+            "num_dead_flags": lambda d: d["num_dead_flags"] <= 5,
+            "plate_gsk": lambda d: d["plate_removal_freq"] >= 0.5,
+            "plate_noc": lambda d: d["plate_removal_freq"] < 0.5,
+            "range_criterion": lambda d: d["range_criterion"].astype(int) == 1,
+            "exited_mitosis": lambda d: ~d["ends_in_mitosis"],
+            "time_in_mitosis_noc": lambda d: d["time_in_mitosis"] >= 60 #this is 60*4 240 minutes; emperically determined
+        }
+
+        qc_mask = pd.Series(True, index=df_qc.index)
+
+        if filters:
+            for f_name in filters:
+                try:
+                    qc_mask &= QC_RULES[f_name](df_qc)
+                except KeyError:
+                    raise ValueError(f"Unknown QC filter: {f_name}")
 
         # keep only PASSING rows
         qc_dfs.append(df_qc.loc[qc_mask].copy())
@@ -83,54 +107,118 @@ def aggregate_clean_dfs(
     return df_agg_c, df_agg_qc
 
 
-def find_slowdeg_regime(group: pd.DataFrame):
+def cp_statistics(
+    group:pd.Grouper, 
+    min_prominence:float=0.25, 
+    rel_height:float=0.9, 
+    dilate:bool=False
+    ) -> pd.Series:
 
-    '''
-    Appends two rows ('slowdeg_regime', 'regime_time') to the 
-    aggregate dataframe from aggregate_clean_dfs()
-    ---------------------------------------------------------
+    """
+    Wrapper to handle pandas groups and return 'frame' of the changepoint and CycB at changept
+    NOTE: params are correct for non time-corrected d/dt traces, units = [intensity/4min]
+    -------------------------------------------------------------------------------------------
     INPUTS:
-        group: pd.DataFrame, grouped dataframe
-    '''
+        group: pd.Grouper, grouped (by cell) df_agg from aggregate_clean_dfs()
+        min_prominence: float, minumum prominence to be considered a peak
+        rel_height: float, percentage of peak height to traverse down to be considered the peak's "base"
+        dilate: bool, whether or not to extent semantic smoothed, guards against Cell-APP ending mitosis early
+    OUTPUTS:
+        pd.Series containing:
+            cp_frame: int, frame of fast phase onset
+            cp_intensity: float, Cyclin B intensity at frame of fast phase onset
+    """
 
     group = group.sort_values("frame")
+    mask = group["semantic_smoothed"].astype(bool)
+    
+    if dilate:
+        mask = binary_dilation(mask, iterations=10)
+    
+    active_phase = group.loc[mask]
+    
+    # Safety check for empty data or missing columns
+    if active_phase.empty or "cycb_deg_rate" not in active_phase:
+        return pd.Series([np.nan, np.nan], index=["cp_frame", "cp_intensity"])
 
-    mask = group["semantic_smoothed"] == 1
-    y = group.loc[mask, "cycb_intensity"]
+    deriv = active_phase["cycb_deg_rate"].to_numpy()
+    
+    # Run the peak detection logic
+    cp_idx, _ = deriv_changept(deriv, min_prominence=min_prominence, rel_height=rel_height)
 
-    slowdeg_regime = pd.Series(0, index=group.index, dtype=int)
-    regime_time = pd.Series(np.nan, index=group.index, dtype=float)
+    if cp_idx is None:
+        return pd.Series([np.nan, np.nan], index=["cp_frame", "cp_intensity"])
 
-    if len(y) < 3:
-        return pd.DataFrame({
-            "slowdeg_regime": slowdeg_regime,
-            "regime_time": regime_time
-        })
+    # Extract the specific row as a Series to grab multiple columns at once
+    cp_row = active_phase.iloc[cp_idx]
+    
+    # Correctness check (optional, for your logs)
+    # assert cp_row["frame"] - cp_idx == active_phase.iloc[0]["frame"]
 
-    cp, i_max, i_min = changept(y.to_numpy())
+    return pd.Series([cp_row["frame"], cp_row["cycb_intensity"]], 
+                     index=["cp_frame", "cp_intensity"])
 
-    frames = group.loc[mask, "frame"].to_numpy()
 
-    cp_frame  = frames[cp]
-    max_frame = frames[i_max]
+def max_cycb_statistics(group: pd.DataFrame) -> pd.Series:
+    """
+    Wrapper to handle pandas groups and return 'frame' of the max CycB and CycB at max frame
+    -------------------------------------------------------------------------------------------
+    INPUTS:
+        group: pd.Grouper, grouped (by cell) df_agg from aggregate_clean_dfs()
+    OUTPUTS:
+        pd.Series containing:
+            max_cycb_frame: int, frame of maximum Cyclin B
+            max_cycb_intensity: float, Cyclin B at max_cycb_frame
+    """
 
-    start = min(cp_frame, max_frame)
-    end   = max(cp_frame, max_frame)
+    # Isolate mitotic region
+    group = group.sort_values("frame")
+    mitotic_region = group[group["semantic_smoothed"] == 1]
+    
+    if mitotic_region.empty:
+        return pd.Series([np.nan, np.nan], index=["max_cycb_frame", "max_cycb_intensity"])
 
-    in_regime = (
-        (group["frame"] >= start) &
-        (group["frame"] <= end)
+    # Find the row with the maximum intensity
+    # .idxmax() returns the index of the first occurrence of the maximum
+    max_idx = mitotic_region["cycb_intensity"].idxmax()
+    max_row = mitotic_region.loc[max_idx]
+
+    return pd.Series(
+        [max_row["frame"], max_row["cycb_intensity"]], 
+        index=["max_cycb_frame", "max_cycb_intensity"]
     )
 
-    slowdeg_regime.loc[in_regime] = 1
 
-    # count frames since regime start
-    regime_time.loc[in_regime] = group.loc[in_regime, "frame"] - start
+def add_deg_semantic(df_agg: pd.DataFrame, df_agg_qc: pd.DataFrame) -> pd.DataFrame:
+    """
+    Creates  'deg_semantic' column in df_agg based on max Cyclin B and changepoint frames.
+    deg_semantic == 1 for (max_cycb_frame < frame <= cp_frame)
+    -------------------------------------------------------------------------------------------
+    INPUTS:
+        df_agg: pd.DataFrame, per-timepoint output of aggregate_clean_dfs()
+        df_agg_qc: pd.DataFrame, per-cell output of aggregate_clean_dfs()
+    OUTPUTS:
+        pd.Series containing:
+            max_cycb_frame: int, frame of maximum Cyclin B
+            max_cycb_intensity: float, Cyclin B at max_cycb_frame
+    """
 
-    return pd.DataFrame({
-        "slowdeg_regime": slowdeg_regime,
-        "regime_time": regime_time
-    })
+    # 1. Select only necessary columns from QC to avoid clutter
+    bounds = df_agg_qc[["date", "well", "cell_id", "max_cycb_frame", "cp_frame"]]
+
+    # 2. Merge these bounds into the main dataframe
+    # This 'broadcasts' the single max/cp frame values to every row of that cell
+    df_merged = df_agg.merge(bounds, on=["date", "well", "cell_id"], how="left")
+
+    # 3. Apply the logic: frames after peak but up to (and including) changepoint
+    # We use .fillna(0) to ensure cells with no CP detection are marked as 0
+    df_merged["deg_semantic"] = (
+        (df_merged["frame"] > df_merged["max_cycb_frame"]) & 
+        (df_merged["frame"] <= df_merged["cp_frame"])
+    ).astype(int)
+
+    # 4. Drop the helper columns to keep df_agg clean
+    return df_merged.drop(columns=["max_cycb_frame", "cp_frame"])
 
 
 def save_chromatin_crops(

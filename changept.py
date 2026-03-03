@@ -1,12 +1,13 @@
 import numpy as np
-from scipy.signal import find_peaks
+from scipy.signal import find_peaks, peak_widths
 import numpy.typing as npt
-from typing import Optional
+from typing import Optional, Tuple
+
 
 def changept(curve: npt.NDArray, search_dist: Optional[int]=1):
 
     '''
-    Simply method to detect when a Cyclin B trace enters its 
+    Simpler method to detect when a Cyclin B trace enters its 
     fast degradation phase. 
 
     Draws a straight line between two anchors: the trace's max value 
@@ -32,7 +33,7 @@ def changept(curve: npt.NDArray, search_dist: Optional[int]=1):
     if i_max == i_min:
         return i_max, i_max, i_min
 
-    # --- look backwards from i_min ---
+    # look backwards from i_min 
     candidates = np.where(y[:i_min] <= y[i_min] + search_dist)[0]
 
     if len(candidates) > 0:
@@ -59,6 +60,52 @@ def changept(curve: npt.NDArray, search_dist: Optional[int]=1):
     cp = i0 + np.argmax(dist)
 
     return cp, i_max, i_min
+
+def deriv_changept(
+    deriv:npt.NDArray, 
+    min_prominence:float=0.25, 
+    rel_height:float=0.9
+    ) -> Tuple[int, int]:
+
+    '''
+    Another hueristic method to detect when a Cyclin B trace enters its 
+    fast degradation phase. Both deriv_changept() and changept() essentially
+    aim to find a peak in Cyclin B curvature.
+
+    INPUTS:
+        deriv: np.narray, derivative of smoothed Cyclin B trace
+        min_prominence: float, minumum prominence to be considered a peak
+        rel_height: float, percentage of peak height to traverse down to be considered the peak's "base"
+    OUTPUTS:
+        cp: int, index at which Cyclin B trace enters fast degradation phase
+        main_peak_index, index of true derivative peak
+    '''
+
+    offset = int((1/2) * deriv.shape[0])
+    deriv_slice = deriv[offset:]
+    
+    peaks, props = find_peaks(
+        deriv_slice, 
+        prominence=min_prominence, 
+        height=min_prominence
+    )
+    
+    if len(peaks) == 0:
+        return None, None
+    
+    # We only care about the last peak (the terminal fast regime)
+    main_peak_slice_idx = [peaks[-1]]
+    
+    # Calculate widths at a specific relative height
+    # This returns: (widths, width_heights, left_ips, right_ips)
+    # left_ips are the interpolated x-positions of the left side of the peak
+    widths_data = peak_widths(deriv_slice, main_peak_slice_idx, rel_height=rel_height)
+    
+    cp_rel = widths_data[2][0] # The left_ips (interpolated left index)
+    main_peak_idx = main_peak_slice_idx[0] + offset
+    cp = int(cp_rel) + offset
+    
+    return cp, main_peak_idx
 
 
 def validate_cyclin_b_trace(trace: np.ndarray):
