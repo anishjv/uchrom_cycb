@@ -30,7 +30,7 @@ from uchrom_cycb.extractRect import findRotMaxRect
 
 @dataclass
 class ChromatinSegConfig:
-    """Configuration for chromatin segmentation parameters."""
+    """Shared configuration class for chromatin segmentation in IXN analysis and area modeling"""
 
     top_hat_radius: int = 15
     psf_size: int = 19
@@ -39,6 +39,7 @@ class ChromatinSegConfig:
     eccentricity_threshold: float = 0.7 #largest region must have eccentricty greater than threshold to be considered for metaphase plate detection
     euler_threshold: float = -2 # can be no more than three holes in the metaphase plate
     truncate_z: Optional[float] = None
+    degrade_img: Optional[bool] = False
 
 
 def airy_disk_psf(NA, wavelength_nm, pixel_size_um, psf_size=51, oversample=1):

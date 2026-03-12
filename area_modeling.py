@@ -62,7 +62,7 @@ def psuedo_cellapp_mask(
 
     theta = props.orientation        # radians
     cy, cx = props.centroid
-    maj = (props.major_axis_length / 2)*1.25
+    maj = (props.major_axis_length / 2)*1.5
     minr = maj
 
     # unit vectors along major and minor axes (row, col)
@@ -108,7 +108,7 @@ def degrade_to_ixn(
 
     # 1. Apply weighted projection (returns float32)
     # n=1.33 is correct for immersion, but check if your 20X is a "Dry" lens (n=1.0)
-    lq_stack = sinc_squared_weighting(hq_stack, 0.17, 0.45, 0.624, n=1.33)
+    lq_stack = sinc_squared_weighting(hq_stack, 0.18, 0.45, 0.624, n=1.33)
     lq_image = np.max(lq_stack, axis=0)
     
     # 2. Explicitly scale intensities to [0, 1] for the deconvolution math
@@ -158,7 +158,8 @@ def sinc_squared_weighting(
     
     # The optical coordinate 'u'
     # u = (2 * pi / lambda) * z * (NA^2 / n)
-    u = (2 * np.pi * na**2 * z) / (n * wavelength_um)
+    k_axial = 2
+    u = (2 * np.pi * na**2 * z) / (k_axial * n * wavelength_um)
     
     # I(z) = [sin(u/4) / (u/4)]^2
     # We use np.sinc, but note: np.sinc(x) is sin(pi*x)/(pi*x)
@@ -253,7 +254,7 @@ def read_chrom_num(
     cell_mask = np.repeat(cell_mask[np.newaxis, ...], seg.shape[0], axis=0)
 
     truncate_z = config.truncate_z
-    if truncate_z is not None and truncate_z < 0.31875*seg.shape[0]:
+    if truncate_z is not None and truncate_z < 0.31875*seg.shape[0]: #0.31875 is the voxel height of the FAST-CHIMP segs
         frames_to_keep = int(round(truncate_z / 0.31875))
         frames_to_trunc = (cell_mask.shape[0] - frames_to_keep) // 2
         cell_mask[:frames_to_trunc] = 0
@@ -328,7 +329,7 @@ def run_pipeline(
     ----------------------------------------------------------------------
     INPUTS:
         seg_3d: np.array, FAST-CHIMP segmentation
-        cell_3d: p.array, 3D Z-stack taken with a high resolution objective
+        cell_3d: np.array, 3D Z-stack taken with a high resolution objective OR 2D pre-degraded image
         config: ChromatinSegConfig, dictionary of common configurations
     OUPUTS:
         for_vals: list, contains following quantities:
@@ -348,9 +349,12 @@ def run_pipeline(
     if config is None:
         config = ChromatinSegConfig()
 
+    if config.degrade_img:
+        cell = degrade_to_ixn(cell_3d)
+    else:
+        cell = cell_3d
 
-    cell = degrade_to_ixn(cell_3d)
-    cell, tophat_cell, deconv_cell = compute_cell_images(cell) 
+    cell, tophat_cell, _ = compute_cell_images(cell) 
     mask = psuedo_cellapp_mask(tophat_cell, config)
     metphs_plt, width = determine_removal_mask(tophat_cell, cell, mask, config)
 
