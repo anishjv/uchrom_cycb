@@ -213,7 +213,7 @@ def cycb_chromatin_batch_analyze(
             num_dead_flags = np.sum(semantic_traces[i]*dead_traces[i])
             time_in_mitosis = np.sum(semantic_traces[i])
             peaks, range, hysteresis = validate_cyclin_b_trace(intensity_traces[i])
-            ends_in_mitosis = (semantic_traces[i] == 1)
+            ends_in_mitosis = (semantic_traces[i][-1] == 1)
                 
             # Get chromatin segmentation data for this cell
             data_tuple = unaligned_chromatin(
@@ -243,11 +243,11 @@ def cycb_chromatin_batch_analyze(
                 meas *= 0.3387**2 #conversion to square microns
                 u_num, (u_num_low, u_num_high), _ = predict_integer_chromosomes(
                     meas,
-                    109.22,
-                    0.072,
-                    7.61,
-                    9.85,
-                    0.305
+                    97.66,
+                    0.055,
+                    4.51,
+                    9.24,
+                    0.24
                 )
                 u_num_trace.append(u_num)
                 u_num_low_trace.append(u_num_low)
