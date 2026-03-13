@@ -5,6 +5,7 @@ from typing import Optional
 import numpy as np
 import skimage
 from skimage.filters import threshold_otsu, gaussian
+from scipy.ndimage import gaussian_filter1d
 from skimage.segmentation import clear_border
 from skimage.morphology import remove_small_objects, binary_dilation, disk
 from skimage.measure import label, regionprops
@@ -85,50 +86,97 @@ def psuedo_cellapp_mask(
 
     return bbox_mask
 
+import numpy as np
+from scipy.ndimage import convolve1d
+from skimage.exposure import rescale_intensity
+from skimage.transform import rescale
+import numpy.typing as npt
+
+
 def degrade_to_ixn(
-    hq_stack: npt.NDArray, 
-    current_ps:float=0.05, 
-    target_ps:float=0.3387
-    ) -> npt.NDArray:
+    hq_stack: npt.NDArray,
+    current_ps: float = 0.05,
+    target_ps: float = 0.3387
+) -> npt.NDArray:
 
     '''
-    Degrades Z-stacks taken on the Joglekar Lab's confocal microscope 
-    to appear as if they were taken with a 0.45 NA, 20X objective. 
-    Note: Z-stacks must have depth greater than focal depth of images 
-    taken with the target (low resolution) objective.
-    -------------------------------------------------------------------
+    Degrades Z-stacks taken on the Joglekar Lab's confocal microscope
+    to appear as if they were taken with a 0.45 NA, 20X objective.
+
     INPUTS:
-        hq_stack: np.array, 3D Z-stack taken with a high resolution objective
-        current_ps: float, XY pixel size in microns of input stack 
-        target_ps: float, XY pixel size in microns of target stack 
-    OUPUTS:
-        matched_image: np.array, 2D degraded image
+        hq_stack: 3D Z-stack (Z,Y,X)
+        current_ps: XY pixel size in microns of input stack
+        target_ps: XY pixel size in microns of target stack
+
+    OUTPUT:
+        matched_image: degraded 2D image
     '''
 
-
-    # 1. Apply weighted projection (returns float32)
-    # n=1.33 is correct for immersion, but check if your 20X is a "Dry" lens (n=1.0)
-    lq_stack = sinc_squared_weighting(hq_stack, 0.18, 0.45, 0.624, n=1.33)
-    lq_image = np.max(lq_stack, axis=0)
-    
-    # 2. Explicitly scale intensities to [0, 1] for the deconvolution math
-    # This replaces the need for the .astype('uint16') hack
-    lq_image = rescale_intensity(lq_image, out_range=(0, 1))
-    lq_smooth_image = gaussian(lq_image, sigma = 7) #sigma computed from rayleigh criterion: sigma ~ [ 0.61 (0.624)/(0.46) ]/2.355 um
-    
-    # 3. Calculate scaling factor
-    scale = current_ps / target_ps 
-    # 4. Apply Anti-Aliasing and Rescale
-    matched_image = rescale(
-        lq_smooth_image, 
-        scale, 
-        anti_aliasing=True, 
-        preserve_range=True, # Keeps the 0-1 range we just set
-        order=1 
+    kernel = sinc_squared_kernel(0.18, 0.46, 0.624, 1.33)
+    blurred_stack = convolve1d(
+        hq_stack.astype(np.float32),
+        kernel,
+        axis=0,
+        mode="nearest"
     )
-    
-    return matched_image.astype('float32')
 
+    # Integrate along Z (widefield-like projection)
+    lq_image = np.sum(blurred_stack, axis=0)
+
+    # Rescale intensities
+    lq_image = rescale_intensity(lq_image, out_range=(0, 1))
+
+    # Downsample to target pixel size
+    scale = current_ps / target_ps
+
+    matched_image = rescale(
+        lq_image,
+        scale,
+        anti_aliasing=True,
+        preserve_range=True,
+        order=1
+    )
+
+    return matched_image.astype("float32")
+
+
+def sinc_squared_kernel(
+    z_microns_per_slice: float,
+    na: float,
+    wavelength_um:float,
+    n: Optional[float]=1.33
+) -> npt.NDArray:
+
+    '''
+    Creates a 1D sinc^2 kernel to mimic the Z-profile 
+    of a widefield microscope's PSF
+    ---------------------------------------------
+    INPUTS:
+        z_microns_per_slice: float, Z pixel size in microns of stack
+        na: float, NA of objective whose focal depth is to be modeled
+        wavelength_um: float, emission wavelength at which image was acquired
+        n: float, refractive index of the used imaging media
+    OUTPUTS:
+        kernel: np.array, 1D kernel
+    '''
+
+    # axial FWHM
+    FWHM_z = 0.88 * n * wavelength_um / na**2
+
+    # truncate kernel to ±2 FWHM
+    z_half_width = 2 * FWHM_z
+    half_slices = int(z_half_width / z_microns_per_slice)
+
+    z = np.arange(-half_slices, half_slices + 1) * z_microns_per_slice
+
+    # optical coordinate
+    u = (2 * np.pi * na**2 * z) / (n * wavelength_um)
+
+    arg = u / (4 * np.pi)
+    kernel = np.sinc(arg)**2
+    kernel /= kernel.sum()
+
+    return kernel
 
 def sinc_squared_weighting(
     stack: npt.NDArray,
