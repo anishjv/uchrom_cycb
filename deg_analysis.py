@@ -189,6 +189,42 @@ def max_cycb_statistics(group: pd.DataFrame) -> pd.Series:
     )
 
 
+def deg_rate_statistics(group: pd.DataFrame) -> pd.Series:
+
+    """
+    Computes the mean and variance of the Cyclin B degradation rate 
+    specifically during the identified degradation window (deg_semantic == 1).
+    -------------------------------------------------------------------------------------------
+    INPUTS:
+        group: pd.DataFrame, a grouped dataframe (per cell) from df_agg
+    OUTPUTS:
+        pd.Series containing:
+            avg_deg_rate: float, mean of cycb_deg_rate during deg_semantic phase
+            var_deg_rate: float, variance of cycb_deg_rate during deg_semantic phase
+    """
+
+    # 1. Isolate the degradation region
+    # We assume 'deg_semantic' has already been mapped to the main dataframe
+    deg_region = group[group["deg_semantic"] == 1]
+    
+    # 2. Handle cases where no degradation window was identified
+    if deg_region.empty or deg_region["cycb_deg_rate"].isna().all():
+        return pd.Series(
+            [np.nan, np.nan], 
+            index=["avg_deg_rate", "var_deg_rate"]
+        )
+
+    # 3. Calculate mean and variance
+    # Pandas .var() uses N-1 (Bessel's correction) by default
+    avg_rate = deg_region["cycb_deg_rate"].mean()
+    var_rate = deg_region["cycb_deg_rate"].var()
+
+    return pd.Series(
+        [avg_rate, var_rate], 
+        index=["avg_deg_rate", "var_deg_rate"]
+    )
+
+
 def add_deg_semantic(df_agg: pd.DataFrame, df_agg_qc: pd.DataFrame) -> pd.DataFrame:
     """
     Creates  'deg_semantic' column in df_agg based on max Cyclin B and changepoint frames.
