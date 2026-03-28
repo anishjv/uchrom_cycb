@@ -120,8 +120,8 @@ def predict_integer_chromosomes(
     
     # Cumulative distribution to find the 95% range
     cumulative_prob = np.cumsum(probs)
-    n_low = n_options[np.searchsorted(cumulative_prob, 0.025)]
-    n_high = n_options[np.searchsorted(cumulative_prob, 0.975)]
+    n_low = n_options[np.searchsorted(cumulative_prob, 0.16)]
+    n_high = n_options[np.searchsorted(cumulative_prob, 0.84)]
     
     return int(n_best), (int(n_low), int(n_high)), probs
 
@@ -243,11 +243,11 @@ def cycb_chromatin_batch_analyze(
                 meas *= 0.3387**2 #conversion to square microns
                 u_num, (u_num_low, u_num_high), _ = predict_integer_chromosomes(
                     meas,
-                    97.66,
-                    0.055,
-                    4.51,
-                    9.24,
-                    0.24
+                    96.44,
+                    0.061,
+                    8.81,
+                    12.96,
+                    0.028
                 )
                 u_num_trace.append(u_num)
                 u_num_low_trace.append(u_num_low)

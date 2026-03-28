@@ -161,7 +161,7 @@ def sinc_squared_kernel(
     '''
 
     # axial FWHM
-    FWHM_z = 0.88 * n * wavelength_um / na**2
+    FWHM_z = (0.88 * n * wavelength_um / na**2)
 
     # truncate kernel to ±2 FWHM
     z_half_width = 2 * FWHM_z
@@ -266,7 +266,8 @@ def read_chrom_num(
     mtphs_plate: npt.NDArray, 
     min_chrom_vol: Optional[int] = 500, 
     max_plate_overlap: Optional[float] = 0.25,
-    min_cell_overlap: Optional[float] = 0.05,
+    min_cell_xy_overlap: Optional[float] = 0.9,
+    min_cell_z_overlap: Optional[float] = 0.05, 
     config: Optional[ChromatinSegConfig] = None
     ) -> tuple[int, npt.NDArray, list[float]]:
 
@@ -317,8 +318,7 @@ def read_chrom_num(
             ).astype('bool')
     mtphs_plate = np.repeat(mtphs_plate[np.newaxis, ...], seg.shape[0], axis=0)
 
-    seg = clear_border(seg, buffer_size=10)
-
+    seg = clear_border(seg, buffer_size=1)
     props = regionprops(seg)
     chroms = np.zeros_like(seg)
     areas = []
@@ -326,28 +326,31 @@ def read_chrom_num(
 
         coords = prop.coords
 
-        # Fraction inside metaphase plate
-        mp_overlap = np.sum(
-            mtphs_plate[
-                coords[:, 0],
-                coords[:, 1],
-                coords[:, 2]
-            ] > 0
-        ) / prop.area
+        # XY Overlap with metaphase plate 
+        mtphs_plate_2d = np.any(mtphs_plate, axis=0) # Flatten mask to XY
+        unique_xy = np.unique(coords[:, 1:], axis=0)
+        mp_xy_overlap_count = np.sum(mtphs_plate_2d[unique_xy[:, 0], unique_xy[:, 1]])
+        fraction_inside_mp = mp_xy_overlap_count / len(unique_xy)
+        
+        # XY Overlap (treating chromosome as a 2D footprint)
+        cell_mask_2d = np.any(cell_mask, axis=0) # Flatten mask to XY
+        
+        xy_overlap_count = np.sum(cell_mask_2d[unique_xy[:, 0], unique_xy[:, 1]])
+        fraction_inside_xy = xy_overlap_count / len(unique_xy)
 
-        # Fraction inside cell mask
-        cell_overlap = np.sum(
-            cell_mask[
-                coords[:, 0],
-                coords[:, 1],
-                coords[:, 2]
-            ] > 0
-        ) / prop.area
+        # Z Overlap (treating chromosome as a 1D span)
+        cell_mask_z = np.any(cell_mask, axis=(1, 2)) # Flatten mask to Z-axis
+        unique_z = np.unique(coords[:, 0])
+        
+        z_overlap_count = np.sum(cell_mask_z[unique_z])
+        fraction_inside_z = z_overlap_count / len(unique_z)
 
-        # Keep if mostly inside cell and mostly outside metaphase plate
+        # Apply Independent Filters
+        # You can now set different thresholds for XY vs Z if needed
         if (
-            mp_overlap < max_plate_overlap and
-            cell_overlap >= min_cell_overlap
+            fraction_inside_mp < max_plate_overlap and
+            fraction_inside_xy >= min_cell_xy_overlap and # Using your existing threshold
+            fraction_inside_z >= min_cell_z_overlap      # or a new 'min_z_overlap'
         ):
 
             chroms[

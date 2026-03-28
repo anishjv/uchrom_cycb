@@ -333,7 +333,7 @@ def remove_metaphase_plate(
     
     # This transforms the LIR into the Bounding Box of the inferred ellipse
     truncate_z = config.truncate_z
-    scale_factor = 1.56*np.sqrt(2)
+    scale_factor = np.sqrt(2)*np.sqrt(2)
     scaled_pts = centroid + (rect_transformed - centroid) * scale_factor
     
     # 3. Create the mask of the scaled rectangle

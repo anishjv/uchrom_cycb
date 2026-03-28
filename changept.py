@@ -86,8 +86,7 @@ def deriv_changept(
     
     peaks, props = find_peaks(
         deriv_slice, 
-        prominence=min_prominence, 
-        height=min_prominence
+        prominence=min_prominence,
     )
     
     if len(peaks) == 0:

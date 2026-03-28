@@ -1,6 +1,6 @@
 import pandas as pd
 import numpy as np
-from typing import Optional, List, Union
+from typing import Optional, List
 import re
 import h5py
 import matplotlib.pyplot as plt
@@ -9,6 +9,7 @@ import sys
 sys.path.append('/Users/whoisv/')
 from uchrom_cycb.changept import deriv_changept
 from scipy.ndimage import binary_dilation
+from skimage.restoration import denoise_tv_chambolle
 
 def aggregate_clean_dfs(
     paths: list[str], 
@@ -129,34 +130,40 @@ def cp_statistics(
             cp_intensity: float, Cyclin B intensity at frame of fast phase onset
     """
 
+    index = ["cp_frame", "cp_intensity", "fast_phs_deg_rate"]
+
     group = group.sort_values("frame")
-    mask = group["semantic_smoothed"].astype(bool)
-    
+
+    mask = group["semantic_smoothed"].fillna(0).astype(bool)
     if dilate:
-        mask = binary_dilation(mask, iterations=10)
-    
+        mask = pd.Series(
+            binary_dilation(mask.values, iterations=20),
+            index=group.index
+        )
+
     active_phase = group.loc[mask]
-    
-    # Safety check for empty data or missing columns
+
     if active_phase.empty or "cycb_deg_rate" not in active_phase:
-        return pd.Series([np.nan, np.nan], index=["cp_frame", "cp_intensity"])
+        return pd.Series([np.nan, np.nan, np.nan], index=index)
 
     deriv = active_phase["cycb_deg_rate"].to_numpy()
-    
-    # Run the peak detection logic
-    cp_idx, _ = deriv_changept(deriv, min_prominence=min_prominence, rel_height=rel_height)
 
-    if cp_idx is None:
-        return pd.Series([np.nan, np.nan], index=["cp_frame", "cp_intensity"])
+    cp_idx, peak_idx = deriv_changept(
+        deriv,
+        min_prominence=min_prominence,
+        rel_height=rel_height
+    )
 
-    # Extract the specific row as a Series to grab multiple columns at once
+    if cp_idx is None or peak_idx is None:
+        return pd.Series([np.nan, np.nan, np.nan], index=index)
+
     cp_row = active_phase.iloc[cp_idx]
-    
-    # Correctness check (optional, for your logs)
-    # assert cp_row["frame"] - cp_idx == active_phase.iloc[0]["frame"]
+    peak_value = deriv[peak_idx]
 
-    return pd.Series([cp_row["frame"], cp_row["cycb_intensity"]], 
-                     index=["cp_frame", "cp_intensity"])
+    return pd.Series(
+        [cp_row["frame"], cp_row["cycb_intensity"], peak_value],
+        index=index
+    )
 
 
 def max_cycb_statistics(group: pd.DataFrame) -> pd.Series:
@@ -204,30 +211,30 @@ def deg_rate_statistics(group: pd.DataFrame) -> pd.Series:
     """
 
     # 1. Isolate the degradation region
-    # We assume 'deg_semantic' has already been mapped to the main dataframe
     deg_region = group[group["deg_semantic"] == 1]
     
-    # 2. Handle cases where no degradation window was identified
-    if deg_region.empty or deg_region["cycb_deg_rate"].isna().all():
-        return pd.Series(
-            [np.nan, np.nan], 
-            index=["avg_deg_rate", "var_deg_rate"]
-        )
+    # Define the index once to keep it DRY (Don't Repeat Yourself)
+    stat_index = ["avg_deg_rate", "var_deg_rate", "min_deg_rate", "max_deg_rate", "range_deg_rate"]
 
-    # 3. Calculate mean and variance
-    # Pandas .var() uses N-1 (Bessel's correction) by default
+    # 2. Handle cases where no degradation window was identified
+    # Added a third np.nan to match the new range_rate column
+    if deg_region.empty or deg_region["cycb_deg_rate"].isna().all():
+        return pd.Series([np.nan, np.nan, np.nan, np.nan, np.nan], index=stat_index)
+
+    # 3. Calculate statistics
     avg_rate = deg_region["cycb_deg_rate"].mean()
     var_rate = deg_region["cycb_deg_rate"].var()
+    max_rate = deg_region["cycb_deg_rate"].max()
+    min_rate = deg_region["cycb_deg_rate"].min()
+    range_rate = max_rate - min_rate
 
-    return pd.Series(
-        [avg_rate, var_rate], 
-        index=["avg_deg_rate", "var_deg_rate"]
-    )
+    # Return all three
+    return pd.Series([avg_rate, var_rate, min_rate, max_rate, range_rate], index=stat_index)
 
 
 def add_deg_semantic(df_agg: pd.DataFrame, df_agg_qc: pd.DataFrame) -> pd.DataFrame:
     """
-    Creates  'deg_semantic' column in df_agg based on max Cyclin B and changepoint frames.
+    Creates  'deg_semantic' and 'deg_time' columns in df_agg based on max Cyclin B and changepoint frames.
     deg_semantic == 1 for (max_cycb_frame < frame <= cp_frame)
     -------------------------------------------------------------------------------------------
     INPUTS:
@@ -239,23 +246,90 @@ def add_deg_semantic(df_agg: pd.DataFrame, df_agg_qc: pd.DataFrame) -> pd.DataFr
             max_cycb_intensity: float, Cyclin B at max_cycb_frame
     """
 
-    # 1. Select only necessary columns from QC to avoid clutter
-    bounds = df_agg_qc[["date", "well", "cell_id", "max_cycb_frame", "cp_frame"]]
+    cell_keys = ["date", "well", "cell_id"]
+    bounds = df_agg_qc[cell_keys + ["max_cycb_frame", "cp_frame"]]
 
-    # 2. Merge these bounds into the main dataframe
-    # This 'broadcasts' the single max/cp frame values to every row of that cell
-    df_merged = df_agg.merge(bounds, on=["date", "well", "cell_id"], how="left")
+    # 1. Merge bounds
+    df_merged = df_agg.merge(bounds, on=cell_keys, how="left")
 
-    # 3. Apply the logic: frames after peak but up to (and including) changepoint
-    # We use .fillna(0) to ensure cells with no CP detection are marked as 0
+    # 2. Identify the degradation phase (semantic == 1)
     df_merged["deg_semantic"] = (
         (df_merged["frame"] > df_merged["max_cycb_frame"]) & 
         (df_merged["frame"] <= df_merged["cp_frame"])
     ).astype(int)
 
-    # 4. Drop the helper columns to keep df_agg clean
+    # 3. Calculate absolute time in phase (0 to N-1)
+    mask = df_merged["deg_semantic"] == 1
+    df_merged["deg_time"] = df_merged[mask].groupby(cell_keys).cumcount()
+    df_merged["deg_time"] = df_merged["deg_time"].fillna(0)
+
+    # 4. Calculate relative time in phase (0.0 to 1.0)
+    # We find the max deg_time for each cell and divide
+    group_max = df_merged.groupby(cell_keys)["deg_time"].transform("max")
+    
+    # We use .where to avoid division by zero if a phase is only 1 frame long
+    df_merged["deg_time_rel"] = (df_merged["deg_time"] / group_max).fillna(0)
+
+    # 5. Clean up
     return df_merged.drop(columns=["max_cycb_frame", "cp_frame"])
 
+
+def add_addl_metrics(
+    df_agg: pd.DataFrame, df_agg_qc: pd.DataFrame, noc:Optional[bool]=False
+    ) ->tuple[pd.DataFrame]:
+
+    """
+    Function to add extra metrics to chromatin.xlsx dataframes
+    -----------------------------------------------------------
+    INPUTS:
+        df_agg: pd.DataFrame, per-timepoint output of aggregate_clean_dfs()
+        df_agg_qc: pd.DataFrame, per-cell output of aggregate_clean_dfs()
+    """
+
+    denoise_weight = 5 if not noc else 51
+    to_dilate = False if not noc else True
+
+    df_agg["cycb_smoothed"] = (
+    df_agg
+    .groupby(["cell_id", "date", "well"], sort=False)["cycb_intensity"]
+    .transform(lambda x: denoise_tv_chambolle(x, weight = denoise_weight))
+    )
+
+
+    df_agg["cycb_deg_rate"] = (
+        df_agg
+        .groupby(["cell_id", "date", "well"], sort=False)["cycb_smoothed"]
+        .transform(lambda x: -1*np.gradient(x))
+    )
+
+    # 1. Get Peak Info
+    max_info = (
+        df_agg.groupby(["date", "well", "cell_id"])
+        .apply(max_cycb_statistics, include_groups=False)
+        .reset_index()
+    )
+    df_agg_qc = df_agg_qc.merge(max_info, on=["date", "well", "cell_id"], how="left")
+
+    # 2. Get Changepoint Info (using your existing calculate_cp)
+    cp_info = (
+        df_agg.groupby(["date", "well", "cell_id"])
+        .apply(cp_statistics, dilate = to_dilate, include_groups=False)
+        .reset_index()
+    )
+    df_agg_qc = df_agg_qc.merge(cp_info, on=["date", "well", "cell_id"], how="left")
+
+    # 3. Generate the actual trace in the time-series data
+    df_agg = add_deg_semantic(df_agg, df_agg_qc)
+
+    # 4. Generate degradation rate info
+    deg_info = (
+        df_agg.groupby(["date", "well", "cell_id"])
+        .apply(deg_rate_statistics, include_groups=False)
+        .reset_index()
+    )
+    df_agg_qc = df_agg_qc.merge(deg_info, on=["date", "well", "cell_id"], how="left")
+
+    return df_agg, df_agg_qc
 
 def save_chromatin_crops(
     cell: np.ndarray,
