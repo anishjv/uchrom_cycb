@@ -355,85 +355,40 @@ def compute_semantic_contig(df: pd.DataFrame) -> pd.Series:
 
     return contig
 
-def pre_drop_ksynth_statistics(group: pd.DataFrame) -> pd.Series:
+
+def synth_rate_statistics(group: pd.DataFrame) -> pd.Series:
     """
-    Finds the frame of maximum cell area drop (t_drop) and estimates k_synth 
-    using the mean and variance of the 5 frames immediately preceding t_drop.
-    t_drop must occur BEFORE the changepoint.
+    Computes the mean and variance of the Cyclin B synthesis rate 
+    (-1 * degradation rate) specifically during the interval of 
+    frames_from_max [-28, -13].
     -------------------------------------------------------------------------------------------
     INPUTS:
-        group: pd.DataFrame, grouped (by cell) df_agg from aggregate_clean_dfs()
+        group: pd.DataFrame, a grouped dataframe (per cell) from df_agg
     OUTPUTS:
         pd.Series containing:
-            t_drop_frame: int, the frame where cell area drops most sharply
-            ksynth_mean: float, average Cyclin B accumulation rate in the 5 pre-drop frames
-            ksynth_var: float, variance of the accumulation rate in the 5 pre-drop frames
+            avg_synth_rate: float, mean of (-1 * cycb_corr_deg_rate) during the window
+            var_synth_rate: float, variance of (-1 * cycb_corr_deg_rate) during the window
     """
+    # 1. Isolate the synthesis baseline region
+    synth_region = group[
+        (group["frames_from_max"] >= -28) & 
+        (group["frames_from_max"] <= -13)
+    ]
     
-    # Sort by frame and reset index so we can safely use integer slicing (iloc)
-    group = group.sort_values("frame").reset_index(drop=True)
-    peak = group["max_cycb_frame"].iloc[0]
-    # Isolate the region 50 timepoints before the peak
-    valid_region = group[(group["frame"] < peak) & (group["frame"] > max(0, peak - 50))]
-    
-    # Check if the valid region is empty or lacks area diff data
-    if valid_region.empty or valid_region["cell_area_deriv"].isna().all():
-        return pd.Series(
-            [np.nan, np.nan, np.nan], 
-            index=["t_drop_frame", "ksynth_mean", "ksynth_var"]
-        )
-        
-    # t_drop is the point of sharpest area decrease strictly BEFORE the peak
-    drop_idx = valid_region["cell_area_deriv"].idxmin()
-    t_drop_frame = group.loc[drop_idx, "frame"]
+    stat_index = ["k_synth_mean", "k_synth_var"]
 
-    mitosis_region = group[group["semantic_contig"] == 1]
-    if mitosis_region.empty:
-        return pd.Series(
-            [np.nan, np.nan, np.nan],
-            index=["t_drop_frame", "ksynth_mean", "ksynth_var"]
-        )
+    # 2. Handle cases where the window is missing or lacks data
+    if synth_region.empty or synth_region["cycb_corr_deg_rate"].isna().all():
+        return pd.Series([np.nan, np.nan], index=stat_index)
 
-    mitosis_start = mitosis_region["frame"].min()
-    # Pre-mitosis = everything before first mitotic frame
-    before_mitosis = group[group["frame"] < mitosis_start]
-    if before_mitosis.empty:
-        return pd.Series(
-            [np.nan, np.nan, np.nan],
-            index=["t_drop_frame", "ksynth_mean", "ksynth_var"]
-        )
+    # 3. Calculate the synthesis rate (-1 * degradation rate)
+    synth_rates = -1 * synth_region["cycb_corr_deg_rate"]
 
-    mean_area_before = before_mitosis["cell_area_smoothed"].mean()
-    mean_area_mitosis = mitosis_region["cell_area_smoothed"].mean()
+    # 4. Calculate statistics
+    avg_rate = synth_rates.mean()
+    var_rate = synth_rates.var()
 
-    frac_drop = (mean_area_before - mean_area_mitosis) / mean_area_before
-    if frac_drop < 0.25:
-        return pd.Series(
-            [np.nan, np.nan, np.nan],
-            index=["t_drop_frame", "ksynth_mean", "ksynth_var"]
-        )
-        
-    # Define the 5-frame window ending two before the drop
-    end_idx = drop_idx - 1
-    start_idx = max(0, end_idx - 5)
-    pre_drop_window = group.iloc[start_idx:end_idx]
-    
-    if len(pre_drop_window) < 2:
-        return pd.Series(
-            [t_drop_frame, np.nan, np.nan], 
-            index=["t_drop_frame", "ksynth_mean", "ksynth_var"]
-        )
-        
-    # 5. Calculate synthesis rates. 
-    # Because cycb_deg_rate = -1 * np.gradient, we multiply by -1 to get positive synthesis rate.
-    synthesis_rates = pre_drop_window["cycb_deg_rate"] * -1
-    ksynth_mean = synthesis_rates.mean()
-    ksynth_var = synthesis_rates.var()
-    
-    return pd.Series(
-        [t_drop_frame, ksynth_mean, ksynth_var], 
-        index=["t_drop_frame", "ksynth_mean", "ksynth_var"]
-    )
+    return pd.Series([avg_rate, var_rate], index=stat_index)
 
 
 def add_addl_metrics(
@@ -462,24 +417,11 @@ def add_addl_metrics(
         .transform(lambda x: -1*np.gradient(x))
     )
 
-    #nec
-    df_agg["cell_area_smoothed"] = (
-    df_agg
-    .groupby(["cell_id", "date", "well"], sort=False)["cell_area"]
-    .transform(lambda x: denoise_tv_chambolle(x.astype('float32'), weight = 200))
-    )
-
-    df_agg["cell_area_deriv"] = (
-        df_agg
-        .groupby(["cell_id", "date", "well"], sort=False)["cell_area_smoothed"]
-        .transform(lambda x: np.gradient(x))
-    )
-
-    #experimental
     df_agg["area_norm"] = (
         df_agg["cell_area"] / 
-        df_agg.groupby(["cell_id", "date", "well"], sort=False)["cell_area_smoothed"].transform('max')
+        df_agg.groupby(["cell_id", "date", "well"], sort=False)["cell_area"].transform('max')
     )
+
     df_agg["cycb_corr"] = df_agg['cycb_intensity'] * df_agg['area_norm']
 
     df_agg["cycb_corr_smoothed"] = (
@@ -528,28 +470,23 @@ def add_addl_metrics(
     )
     df_agg_qc = df_agg_qc.merge(deg_info, on=["date", "well", "cell_id"], how="left")
 
+    # 5. Merge max_cycb_frame back into df_agg early so we can calculate frames_from_max
     df_agg = df_agg.merge(
-            df_agg_qc[["date", "well", "cell_id", "max_cycb_frame"]], 
-            on=["date", "well", "cell_id"], 
-            how="left"
-        )
-
-    area_info = (
-        df_agg.groupby(["date", "well", "cell_id"])
-        .apply(pre_drop_ksynth_statistics, include_groups=False)
-        .reset_index()
-    )
-    df_agg_qc = df_agg_qc.merge(area_info, on=["date", "well", "cell_id"], how="left")
-
-    df_agg = df_agg.merge(
-        df_agg_qc[["date", "well", "cell_id", "t_drop_frame"]],
-        on=["date", "well", "cell_id"],
+        df_agg_qc[["date", "well", "cell_id", "max_cycb_frame"]], 
+        on=["date", "well", "cell_id"], 
         how="left"
     )
     
-    # Calculate the relative time axis (t=0 is t_drop)
-    df_agg["frames_from_drop"] = df_agg["frame"] - df_agg["t_drop_frame"]
+    # 6. Calculate relative time BEFORE applying the new synthesis function
     df_agg["frames_from_max"] = df_agg["frame"] - df_agg["max_cycb_frame"]
+
+    # 7. Generate baseline synthesis rate info
+    synth_info = (
+        df_agg.groupby(["date", "well", "cell_id"])
+        .apply(synth_rate_statistics, include_groups=False)
+        .reset_index()
+    )
+    df_agg_qc = df_agg_qc.merge(synth_info, on=["date", "well", "cell_id"], how="left")
 
     return df_agg, df_agg_qc
 
