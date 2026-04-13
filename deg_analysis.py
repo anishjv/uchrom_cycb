@@ -8,67 +8,110 @@ import math
 import sys
 sys.path.append('/Users/whoisv/')
 from uchrom_cycb.changept import deriv_changept
-from scipy.ndimage import binary_dilation
+from scipy.ndimage import binary_dilation, median_filter
 from skimage.restoration import denoise_tv_chambolle
+from scipy.signal import peak_widths
+import warnings
+warnings.filterwarnings("ignore", message="some peaks have a prominence of 0")
+warnings.filterwarnings("ignore", message="some peaks have a width of 0")
+
+
+def get_cycb_widths(group: pd.DataFrame) -> float:
+    """
+    Calculates CycB peak width. Returns 10000.0 if no peak is found.
+    """
+    trace = group['cycb_intensity'].values
+    
+    # Handle empty, all-NaN, or constant traces to avoid PeakPropertyWarning
+    if len(trace) < 3 or np.all(np.isnan(trace)) or np.ptp(trace) == 0:
+        return 10000.0
+        
+    peak_pos = np.nanargmax(trace)
+
+    widths, _, _, _ = peak_widths(trace, [peak_pos], rel_height=0.25)
+
+    if int(widths[0]) <= 3:
+        return 10000.0
+    else:
+        return widths[0]
+
 
 def aggregate_clean_dfs(
     paths: list[str], 
     datewell_keep: Optional[list[str]]=None,
     pos_avoid: Optional[list[str]]=None,
-    filters: Optional[list[str]]=None
-    ) -> tuple[pd.DataFrame]:
+    filters: Optional[list[str]]=None,
+    return_failed: bool = False
+    ) -> tuple[pd.DataFrame, ...]:
 
     '''
     Aggregates chromatin.xlsx dataframes
     --------------------------------------
     INPUTS:
         paths: list[str], list of paths to chromatin.xlsx files
-        datewell_keep[str], datewells to aggregate
+        datewell_keep: Optional[list[str]], datewells to aggregate
+        pos_avoid: Optional[list[str]], positions to avoid
+        filters: Optional[list[str]], QC filters to apply
+        return_failed: bool, if True, returns passing and failing dfs
     OUTPUTS:
-
+        If return_failed is False: (df_agg_c, df_agg_qc)
+        If return_failed is True:  (df_agg_c, df_agg_qc, df_failed_c, df_failed_qc)
     '''
 
     dfs = []
     qc_dfs = []
-    failed_records = []
+    failed_qc_dfs = []
 
     for f in paths:
+        date_match = re.search(r"20\d{2}(0[1-9]|1[0-2])(0[1-9]|[12][0-9]|3[01])", str(f))
+        well_match = re.search(r"[A-H]([1-9]|0[1-9]|1[0-2])_s(\d{1,2})", str(f))
+        
+        if not (date_match and well_match):
+            continue
+            
+        date, well = date_match.group(), well_match.group()
 
-        date = re.search(r"20\d{2}(0[1-9]|1[0-2])(0[1-9]|[12][0-9]|3[01])", str(f)).group()
-        well = re.search(r"[A-H]([1-9]|0[1-9]|1[0-2])_s(\d{1,2})", str(f)).group()
-
-        if datewell_keep: #keep certain wells
-            if not any(stub in date + well[0] for stub in datewell_keep):
-                continue
-
-        if pos_avoid: #avoid certain positions
-            if any(stub in (date + '_' + well) for stub in pos_avoid):
-                continue
+        if datewell_keep and not any(stub in date + well[0] for stub in datewell_keep):
+            continue
+        if pos_avoid and any(stub in (date + '_' + well) for stub in pos_avoid):
+            continue
 
         print(f"Aggregating {date}, {well}")
 
         df = pd.read_excel(f)
         df_qc = pd.read_excel(f, sheet_name=1)
 
-        df["date"] = date
-        df["well"] = well
-        df["date-well"] = df["date"] + df["well"].str[0]
+        # Basic ID tagging
+        for d in [df, df_qc]:
+            d["date"], d["well"] = date, well
+            d["date-well"] = d["date"] + d["well"].str[0]
 
-        df_qc["date"] = date
-        df_qc["well"] = well
-        df_qc["date-well"] = df_qc["date"] + df_qc["well"].str[0]
-        dfs.append(df)
-
-        #TODO: integrate exited mitosis flag in degradation.py
+        # Feature Calculations
+        
+        # 1. Mitosis Exit Check
         ends_in_mitosis = (
-            df
-            .sort_values(["cell_id", "frame"])
+            df.sort_values(["cell_id", "frame"])
             .groupby("cell_id")["semantic_smoothed"]
-            .last()
-            .eq(1)
+            .last().eq(1)
         )
-
         df_qc["ends_in_mitosis"] = df_qc["cell_id"].map(ends_in_mitosis).fillna(False)
+
+        # 2. cellapp-start: Cyclin B Peak Sync Check
+        # Does the global CycB max occur while semantic_smoothed == 1?
+        # This guards against Cell-APP starting mitosis late
+        idx_max_cycb = df.dropna(subset=['cycb_intensity']).groupby('cell_id')['cycb_intensity'].idxmax()
+        cycb_max_is_mitotic = df.loc[idx_max_cycb].set_index('cell_id')['semantic_smoothed'].eq(1)
+        df_qc["cycb_max_in_mitosis"] = df_qc["cell_id"].map(cycb_max_is_mitotic).fillna(False)
+
+        # 3. cellapp-end: Cyclin B Decay Width Check (The Scipy Integration)
+        # Calculate the 'physical' width of the CycB peak per cell
+        # this guards against Cell-APP ending mitosis early
+        cycb_widths = (
+            df.groupby('cell_id')[['cycb_intensity']] # Explicitly select column
+            .apply(get_cycb_widths, include_groups=False) # Silence deprecation warning
+        )
+        df_qc["cycb_decay_width"] = df_qc["cell_id"].map(cycb_widths).fillna(0.0)
+
 
         QC_RULES = {
             "num_dead_flags": lambda d: d["num_dead_flags"] <= 5,
@@ -76,37 +119,38 @@ def aggregate_clean_dfs(
             "plate_noc": lambda d: d["plate_removal_freq"] < 0.5,
             "range_criterion": lambda d: d["range_criterion"].astype(int) == 1,
             "exited_mitosis": lambda d: ~d["ends_in_mitosis"],
-            "time_in_mitosis_noc": lambda d: d["time_in_mitosis"] >= 60 #this is 60*4 240 minutes; emperically determined
+            "time_in_mitosis_noc": lambda d: d["time_in_mitosis"] >= 40,
+            "cellapp_start": lambda d: d["cycb_max_in_mitosis"],
+            "cellapp_end": lambda d: (d["time_in_mitosis"] / d["cycb_decay_width"]) >= 0.75
         }
 
         qc_mask = pd.Series(True, index=df_qc.index)
-
         if filters:
             for f_name in filters:
-                try:
+                if f_name in QC_RULES:
                     qc_mask &= QC_RULES[f_name](df_qc)
-                except KeyError:
+                else:
                     raise ValueError(f"Unknown QC filter: {f_name}")
 
-        # keep only PASSING rows
+        # Store results
+        dfs.append(df)
         qc_dfs.append(df_qc.loc[qc_mask].copy())
-
-        failed_rows = df_qc.loc[~qc_mask, ["cell_id"]].copy()
-        failed_rows["date"] = date
-        failed_rows["well"] = well
-        failed_records.append(failed_rows)
+        failed_qc_dfs.append(df_qc.loc[~qc_mask].copy())
 
     df_agg = pd.concat(dfs, ignore_index=True)
     df_agg_qc = pd.concat(qc_dfs, ignore_index=True)
-    df_failed = pd.concat(failed_records, ignore_index=True)
+    df_failed_qc = pd.concat(failed_qc_dfs, ignore_index=True)
 
-    failed_index = pd.MultiIndex.from_frame(df_failed[["cell_id", "date", "well"]])
+    failed_index = pd.MultiIndex.from_frame(df_failed_qc[["cell_id", "date", "well"]])
     agg_index = pd.MultiIndex.from_frame(df_agg[["cell_id", "date", "well"]])
 
     df_agg_c = df_agg[~agg_index.isin(failed_index)]
-
+    
+    if return_failed:
+        df_failed_c = df_agg[agg_index.isin(failed_index)]
+        return df_agg_c, df_agg_qc, df_failed_c, df_failed_qc
+        
     return df_agg_c, df_agg_qc
-
 
 def cp_statistics(
     group:pd.Grouper, 
@@ -133,15 +177,12 @@ def cp_statistics(
     index = ["cp_frame", "cp_intensity", "fast_phs_deg_rate"]
 
     group = group.sort_values("frame")
-
-    mask = group["semantic_smoothed"].fillna(0).astype(bool)
     if dilate:
-        mask = pd.Series(
-            binary_dilation(mask.values, iterations=20),
-            index=group.index
-        )
-
-    active_phase = group.loc[mask]
+        mask = group["semantic_contig"].values.astype(bool)
+        mask = binary_dilation(mask, iterations=20)
+        active_phase = group[mask]
+    else:
+        active_phase = group[group["semantic_contig"] == 1]
 
     if active_phase.empty or "cycb_deg_rate" not in active_phase:
         return pd.Series([np.nan, np.nan, np.nan], index=index)
@@ -180,7 +221,7 @@ def max_cycb_statistics(group: pd.DataFrame) -> pd.Series:
 
     # Isolate mitotic region
     group = group.sort_values("frame")
-    mitotic_region = group[group["semantic_smoothed"] == 1]
+    mitotic_region = group[group["semantic_contig"] == 1]
     
     if mitotic_region.empty:
         return pd.Series([np.nan, np.nan], index=["max_cycb_frame", "max_cycb_intensity"])
@@ -255,7 +296,7 @@ def add_deg_semantic(df_agg: pd.DataFrame, df_agg_qc: pd.DataFrame) -> pd.DataFr
     # 2. Identify the degradation phase (semantic == 1)
     df_merged["deg_semantic"] = (
         (df_merged["frame"] > df_merged["max_cycb_frame"]) & 
-        (df_merged["frame"] <= df_merged["cp_frame"])
+        (df_merged["frame"] < df_merged["cp_frame"])
     ).astype(int)
 
     # 3. Calculate absolute time in phase (0 to N-1)
@@ -274,6 +315,127 @@ def add_deg_semantic(df_agg: pd.DataFrame, df_agg_qc: pd.DataFrame) -> pd.DataFr
     return df_merged.drop(columns=["max_cycb_frame", "cp_frame"])
 
 
+def compute_semantic_contig(df: pd.DataFrame) -> pd.Series:
+    """
+    Identifies the largest contiguous block of semantic_smoothed == 1 and
+    returns a binary indicator marking membership in that block.
+
+    -----------------------------------------------------------------------------
+    INPUTS:
+        df: pd.DataFrame
+            Must contain:
+                - 'semantic_smoothed' (binary or boolean-like)
+                - sorted or unsorted by frame (function handles sorting implicitly
+                  if needed upstream; assumes row order corresponds to time or
+                  has consistent indexing within a cell group)
+    OUTPUTS:
+        pd.Series (int)
+            Binary series of same length as df:
+                1 → frame belongs to the largest contiguous semantic == 1 block
+                0 → all other frames
+            If no semantic == 1 region exists, returns all zeros.
+    """
+
+    mask = df["semantic_smoothed"] == 1
+
+    if not mask.any():
+        return pd.Series(0, index=df.index)
+
+    block_id = (mask != mask.shift()).cumsum()
+
+    blocks = df[mask].groupby(block_id[mask])
+
+    if len(blocks) == 0:
+        return pd.Series(0, index=df.index)
+
+    largest_block = max(blocks, key=lambda x: len(x[1]))[1]
+
+    contig = pd.Series(0, index=df.index)
+    contig.loc[largest_block.index] = 1
+
+    return contig
+
+def pre_drop_ksynth_statistics(group: pd.DataFrame) -> pd.Series:
+    """
+    Finds the frame of maximum cell area drop (t_drop) and estimates k_synth 
+    using the mean and variance of the 5 frames immediately preceding t_drop.
+    t_drop must occur BEFORE the changepoint.
+    -------------------------------------------------------------------------------------------
+    INPUTS:
+        group: pd.DataFrame, grouped (by cell) df_agg from aggregate_clean_dfs()
+    OUTPUTS:
+        pd.Series containing:
+            t_drop_frame: int, the frame where cell area drops most sharply
+            ksynth_mean: float, average Cyclin B accumulation rate in the 5 pre-drop frames
+            ksynth_var: float, variance of the accumulation rate in the 5 pre-drop frames
+    """
+    
+    # Sort by frame and reset index so we can safely use integer slicing (iloc)
+    group = group.sort_values("frame").reset_index(drop=True)
+    peak = group["max_cycb_frame"].iloc[0]
+    # Isolate the region 50 timepoints before the peak
+    valid_region = group[(group["frame"] < peak) & (group["frame"] > max(0, peak - 50))]
+    
+    # Check if the valid region is empty or lacks area diff data
+    if valid_region.empty or valid_region["cell_area_deriv"].isna().all():
+        return pd.Series(
+            [np.nan, np.nan, np.nan], 
+            index=["t_drop_frame", "ksynth_mean", "ksynth_var"]
+        )
+        
+    # t_drop is the point of sharpest area decrease strictly BEFORE the peak
+    drop_idx = valid_region["cell_area_deriv"].idxmin()
+    t_drop_frame = group.loc[drop_idx, "frame"]
+
+    mitosis_region = group[group["semantic_contig"] == 1]
+    if mitosis_region.empty:
+        return pd.Series(
+            [np.nan, np.nan, np.nan],
+            index=["t_drop_frame", "ksynth_mean", "ksynth_var"]
+        )
+
+    mitosis_start = mitosis_region["frame"].min()
+    # Pre-mitosis = everything before first mitotic frame
+    before_mitosis = group[group["frame"] < mitosis_start]
+    if before_mitosis.empty:
+        return pd.Series(
+            [np.nan, np.nan, np.nan],
+            index=["t_drop_frame", "ksynth_mean", "ksynth_var"]
+        )
+
+    mean_area_before = before_mitosis["cell_area_smoothed"].mean()
+    mean_area_mitosis = mitosis_region["cell_area_smoothed"].mean()
+
+    frac_drop = (mean_area_before - mean_area_mitosis) / mean_area_before
+    if frac_drop < 0.25:
+        return pd.Series(
+            [np.nan, np.nan, np.nan],
+            index=["t_drop_frame", "ksynth_mean", "ksynth_var"]
+        )
+        
+    # Define the 5-frame window ending two before the drop
+    end_idx = drop_idx - 1
+    start_idx = max(0, end_idx - 5)
+    pre_drop_window = group.iloc[start_idx:end_idx]
+    
+    if len(pre_drop_window) < 2:
+        return pd.Series(
+            [t_drop_frame, np.nan, np.nan], 
+            index=["t_drop_frame", "ksynth_mean", "ksynth_var"]
+        )
+        
+    # 5. Calculate synthesis rates. 
+    # Because cycb_deg_rate = -1 * np.gradient, we multiply by -1 to get positive synthesis rate.
+    synthesis_rates = pre_drop_window["cycb_deg_rate"] * -1
+    ksynth_mean = synthesis_rates.mean()
+    ksynth_var = synthesis_rates.var()
+    
+    return pd.Series(
+        [t_drop_frame, ksynth_mean, ksynth_var], 
+        index=["t_drop_frame", "ksynth_mean", "ksynth_var"]
+    )
+
+
 def add_addl_metrics(
     df_agg: pd.DataFrame, df_agg_qc: pd.DataFrame, noc:Optional[bool]=False
     ) ->tuple[pd.DataFrame]:
@@ -286,20 +448,57 @@ def add_addl_metrics(
         df_agg_qc: pd.DataFrame, per-cell output of aggregate_clean_dfs()
     """
 
-    denoise_weight = 5 if not noc else 51
     to_dilate = False if not noc else True
 
     df_agg["cycb_smoothed"] = (
-    df_agg
-    .groupby(["cell_id", "date", "well"], sort=False)["cycb_intensity"]
-    .transform(lambda x: denoise_tv_chambolle(x, weight = denoise_weight))
+        df_agg
+        .groupby(["cell_id", "date", "well"], sort=False)["cycb_intensity"]
+        .transform(lambda x: denoise_tv_chambolle(x, weight = 5))
     )
-
 
     df_agg["cycb_deg_rate"] = (
         df_agg
         .groupby(["cell_id", "date", "well"], sort=False)["cycb_smoothed"]
         .transform(lambda x: -1*np.gradient(x))
+    )
+
+    #nec
+    df_agg["cell_area_smoothed"] = (
+    df_agg
+    .groupby(["cell_id", "date", "well"], sort=False)["cell_area"]
+    .transform(lambda x: denoise_tv_chambolle(x.astype('float32'), weight = 200))
+    )
+
+    df_agg["cell_area_deriv"] = (
+        df_agg
+        .groupby(["cell_id", "date", "well"], sort=False)["cell_area_smoothed"]
+        .transform(lambda x: np.gradient(x))
+    )
+
+    #experimental
+    df_agg["area_norm"] = (
+        df_agg["cell_area"] / 
+        df_agg.groupby(["cell_id", "date", "well"], sort=False)["cell_area_smoothed"].transform('max')
+    )
+    df_agg["cycb_corr"] = df_agg['cycb_intensity'] * df_agg['area_norm']
+
+    df_agg["cycb_corr_smoothed"] = (
+        df_agg
+        .groupby(["cell_id", "date", "well"], sort=False)["cycb_corr"]
+        .transform(lambda x: denoise_tv_chambolle(x, weight = 5))
+    )
+    
+    df_agg["cycb_corr_deg_rate"] = (
+        df_agg
+        .groupby(["cell_id", "date", "well"], sort=False)["cycb_corr_smoothed"]
+        .transform(lambda x: -1*np.gradient(x))
+    )
+
+    df_agg["semantic_contig"] = (
+        df_agg
+        .groupby(["cell_id", "date", "well"], sort=False)
+        .apply(compute_semantic_contig)
+        .reset_index(level=[0,1,2], drop=True)
     )
 
     # 1. Get Peak Info
@@ -328,6 +527,29 @@ def add_addl_metrics(
         .reset_index()
     )
     df_agg_qc = df_agg_qc.merge(deg_info, on=["date", "well", "cell_id"], how="left")
+
+    df_agg = df_agg.merge(
+            df_agg_qc[["date", "well", "cell_id", "max_cycb_frame"]], 
+            on=["date", "well", "cell_id"], 
+            how="left"
+        )
+
+    area_info = (
+        df_agg.groupby(["date", "well", "cell_id"])
+        .apply(pre_drop_ksynth_statistics, include_groups=False)
+        .reset_index()
+    )
+    df_agg_qc = df_agg_qc.merge(area_info, on=["date", "well", "cell_id"], how="left")
+
+    df_agg = df_agg.merge(
+        df_agg_qc[["date", "well", "cell_id", "t_drop_frame"]],
+        on=["date", "well", "cell_id"],
+        how="left"
+    )
+    
+    # Calculate the relative time axis (t=0 is t_drop)
+    df_agg["frames_from_drop"] = df_agg["frame"] - df_agg["t_drop_frame"]
+    df_agg["frames_from_max"] = df_agg["frame"] - df_agg["max_cycb_frame"]
 
     return df_agg, df_agg_qc
 

@@ -45,10 +45,12 @@ def retrieve_traces(
     semantic_traces = []
     frame_traces = []
     dead_traces = []
+    area_traces = []
     t_char = 20 // frame_interval
 
     for id in analysis_df["particle"].unique():
         intensity = analysis_df.query(f"particle=={id}")[f"{wl}"].to_numpy()
+        area = analysis_df.query(f"particle=={id}")["area"].to_numpy()
         semantic = analysis_df.query(f"particle=={id}")["semantic_smoothed"].to_numpy()
         bkg = analysis_df.query(f"particle=={id}")[f"{wl}_bkg_corr"].to_numpy()
         shading = analysis_df.query(f"particle=={id}")[f"{wl}_int_corr"].to_numpy()
@@ -76,9 +78,10 @@ def retrieve_traces(
         semantic_traces.append(semantic)
         frame_traces.append(frames)
         dead_traces.append(dead)
+        area_traces.append(area)
         ids.append(id)
 
-    return intensity_traces, semantic_traces, frame_traces, dead_traces, ids
+    return intensity_traces, semantic_traces, frame_traces, dead_traces, area_traces, ids
 
 
 def area_model(N, A_max, f, beta):
@@ -178,10 +181,10 @@ def cycb_chromatin_batch_analyze(
         analysis_df.dropna(inplace=True)
 
         print(f"Working on position: {name_stub}")
-        intensity_traces, semantic_traces, frame_traces, dead_traces, ids = (
+        intensity_traces, semantic_traces, frame_traces, dead_traces, cell_area_traces, ids = (
             retrieve_traces(analysis_df, "GFP", int(frame_interval_minutes))
         )
-
+    
         # Initialize dataframe with empty lists for each column
         degradation_data = pd.DataFrame(
             {
@@ -189,6 +192,7 @@ def cycb_chromatin_batch_analyze(
                 "frame": [],
                 "cycb_intensity": [],
                 "semantic_smoothed": [],
+                'cell_area': [],
                 "u_area": [],
                 "u_area_intensity": [],
                 "t_area": [],
@@ -235,7 +239,6 @@ def cycb_chromatin_batch_analyze(
                 ) = data_tuple
 
 
-            # New: for predicting chromosome number from chromosome areas
             u_num_trace = []
             u_num_low_trace = []
             u_num_high_trace = []
@@ -249,6 +252,7 @@ def cycb_chromatin_batch_analyze(
                     12.96,
                     0.028
                 )
+
                 u_num_trace.append(u_num)
                 u_num_low_trace.append(u_num_low)
                 u_num_high_trace.append(u_num_high)
@@ -261,6 +265,7 @@ def cycb_chromatin_batch_analyze(
                 "frame": frames,
                 "cycb_intensity": intensity_traces[i],
                 "semantic_smoothed": semantic_traces[i],
+                "cell_area": cell_area_traces[i],
                 "u_area": u_area_trace,
                 "u_area_intensity": u_area_int_trace,
                 "a_area": np.asarray(t_area_trace) - np.asarray(u_area_trace),
