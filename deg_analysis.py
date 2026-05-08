@@ -10,7 +10,7 @@ sys.path.append('/Users/whoisv/')
 from uchrom_cycb.changept import deriv_changept
 from scipy.ndimage import binary_dilation, median_filter
 from skimage.restoration import denoise_tv_chambolle
-from scipy.signal import peak_widths
+from scipy.signal import peak_widths, find_peaks, peak_prominences
 import warnings
 warnings.filterwarnings("ignore", message="some peaks have a prominence of 0")
 warnings.filterwarnings("ignore", message="some peaks have a width of 0")
@@ -206,6 +206,98 @@ def cp_statistics(
         index=index
     )
 
+def area_jump_statistics(
+    group: pd.DataFrame,
+    min_height: float = 1,
+) -> pd.Series:
+
+    """
+    Wrapper to handle pandas groups and return frames corresponding to area collapse dynamics
+    -------------------------------------------------------------------------------------------
+    For each cell, defines a search window spanning from 2× mitotic duration before mitotic onset
+    to the midpoint of mitosis, then identifies the largest negative excursion in area derivative
+    (i.e., the steepest drop in area). The dominant peak is selected based on absolute height
+    (not prominence), and the onset/stabilization of the collapse are defined as the points where
+    the signal falls to 50% of peak height on the left and right flanks.
+
+    -------------------------------------------------------------------------------------------
+    INPUTS:
+        group: pd.DataFrame, grouped (by cell) dataframe containing:
+            - 'frame': int, time index
+            - 'semantic_contig': int/bool, contiguous mitotic annotation (1 = mitosis)
+            - 'area_derivative': float, time derivative of cell area
+        min_height: float, minimum peak height in -area_derivative required to consider
+                    a candidate area collapse event
+
+    OUTPUTS:
+        pd.Series containing:
+            t_areajump: int, frame corresponding to left 75% height crossing of dominant peak
+                        (interpreted as onset of area collapse)
+            t_areastable: int, frame corresponding to right 50% height crossing of dominant peak
+                          (interpreted as post-collapse stabilization)
+            jump_height: float, height of the detected peak in -area_derivative
+                         (proxy for magnitude of area collapse)
+    """
+
+    index = ["t_areajump", "t_areastable", "jump_height"]
+
+    group = group.sort_values("frame").reset_index(drop=True)
+
+    cycb = group['cycb_smoothed'].to_numpy()
+    sem = group["semantic_contig"].to_numpy()
+    area_deriv = group["area_derivative"].to_numpy()
+    frames = group["frame"].to_numpy()
+
+    # --- identify mitotic region ---
+    mito_idx = np.where(sem == 1)[0]
+    if len(mito_idx) == 0:
+        return pd.Series([np.nan, np.nan, np.nan], index=index)
+    start_mito = mito_idx[0]
+
+    # --- define search window ---
+    start_idx = max(0, start_mito - 25)
+    end_idx = np.argmax(cycb)
+
+    if end_idx <= start_idx:
+        return pd.Series([np.nan, np.nan, np.nan], index=index)
+
+    # invert to detect drops as peaks
+    window_signal = -area_deriv[start_idx:end_idx]
+
+    # --- peak detection (height-based) ---
+    peaks, props = find_peaks(window_signal, height=min_height)
+    if len(peaks) == 0:
+        return pd.Series([np.nan, np.nan, np.nan], index=index)
+
+    heights = props["peak_heights"]
+
+    # --- select tallest peak ---
+    best = np.argmax(heights)
+    peak_idx = peaks[best]
+
+    # --- compute 75% height crossings ---
+    widths, width_heights, left_ips, right_ips = peak_widths(
+        window_signal,
+        [peak_idx],
+        rel_height=0.75 #X% of the way down
+    )
+
+    left_ip = left_ips[0]
+    right_ip = right_ips[0]
+
+    # --- map back to global indices ---
+    global_left = int(np.floor(start_idx + left_ip))
+    global_right = int(np.ceil(start_idx + right_ip))
+
+    return pd.Series(
+        [
+            frames[global_left],
+            frames[global_right],
+            heights[best],
+        ],
+        index=index
+    )
+
 
 def max_cycb_statistics(group: pd.DataFrame) -> pd.Series:
     """
@@ -319,7 +411,6 @@ def compute_semantic_contig(df: pd.DataFrame) -> pd.Series:
     """
     Identifies the largest contiguous block of semantic_smoothed == 1 and
     returns a binary indicator marking membership in that block.
-
     -----------------------------------------------------------------------------
     INPUTS:
         df: pd.DataFrame
@@ -356,39 +447,180 @@ def compute_semantic_contig(df: pd.DataFrame) -> pd.Series:
     return contig
 
 
-def synth_rate_statistics(group: pd.DataFrame) -> pd.Series:
+def synth_rate_statistics(group, df_agg_qc, min_seg=3):
     """
-    Computes the mean and variance of the Cyclin B synthesis rate 
-    (-1 * degradation rate) specifically during the interval of 
-    frames_from_max [-28, -13].
-    -------------------------------------------------------------------------------------------
-    INPUTS:
-        group: pd.DataFrame, a grouped dataframe (per cell) from df_agg
-    OUTPUTS:
+    Estimate Cyclin B synthesis/degradation rates using smoothed
+    derivative measurements ('cycb_deg_rate') in matched windows
+    before and after NEB.
+
+    Strategy:
+    1. Detect likely NEB timing from the largest positive jump in
+       Cyclin B intensity near t_areajump.
+
+    2. Define matched windows:
+           back  = pre-NEB
+           front = post-NEB
+
+       while excluding frames immediately surrounding NEB.
+
+    3. Compute mean derivative-based rates within each window.
+    ------------------------------------------------------------------
+    REQUIRED COLUMNS:
+        group:
+            - frame
+            - cycb_smoothed
+            - cycb_deg_rate
+
+        df_agg_qc:
+            - t_areajump
+            - max_cycb_frame
+
+    RETURNS:
         pd.Series containing:
-            avg_synth_rate: float, mean of (-1 * cycb_corr_deg_rate) during the window
-            var_synth_rate: float, variance of (-1 * cycb_corr_deg_rate) during the window
+            t_nucbrk
+            ksynth_back
+            ksynth_front
+            std_back
+            std_front
+            back_start
+            back_end
+            front_start
+            front_end
+            back_window_size
+            front_window_size
     """
-    # 1. Isolate the synthesis baseline region
-    synth_region = group[
-        (group["frames_from_max"] >= -28) & 
-        (group["frames_from_max"] <= -13)
+
+    return_index = [
+        "t_nucbrk",
+        "ksynth_back",
+        "ksynth_front",
+        "std_back",
+        "std_front",
+        "back_start",
+        "back_end",
+        "front_start",
+        "front_end",
+        "back_window_size",
+        "front_window_size"
     ]
-    
-    stat_index = ["k_synth_mean", "k_synth_var"]
 
-    # 2. Handle cases where the window is missing or lacks data
-    if synth_region.empty or synth_region["cycb_corr_deg_rate"].isna().all():
-        return pd.Series([np.nan, np.nan], index=stat_index)
+    nan_return = pd.Series(
+        [np.nan] * len(return_index),
+        index=return_index
+    )
 
-    # 3. Calculate the synthesis rate (-1 * degradation rate)
-    synth_rates = -1 * synth_region["cycb_corr_deg_rate"]
+    group = group.sort_values("frame")
 
-    # 4. Calculate statistics
-    avg_rate = synth_rates.mean()
-    var_rate = synth_rates.var()
+    # Lookup QC metrics
+    key_cols = ["cell_id", "date", "well"]
+    key = tuple(group.iloc[0][key_cols])
 
-    return pd.Series([avg_rate, var_rate], index=stat_index)
+    qc = df_agg_qc.set_index(key_cols).loc[key]
+
+    t_areajump = qc["t_areajump"]
+    t_max = qc["max_cycb_frame"]
+
+    if np.isnan(t_areajump) or np.isnan(t_max):
+        return nan_return
+
+    frames = group["frame"].to_numpy()
+    y = group["cycb_smoothed"].to_numpy()
+
+    # Detect NEB-associated influx jump
+    search_mask = (
+        (frames >= t_areajump - 10) &
+        (frames <= t_areajump + 10)
+    )
+
+    if np.sum(search_mask) < min_seg:
+        return nan_return
+
+    search_frames = frames[search_mask]
+    search_y = y[search_mask]
+
+    diffs = np.diff(search_y)
+
+    if len(diffs) == 0:
+        return nan_return
+
+    # largest positive jump = likely NEB-associated influx
+    jump_idx = np.argmax(diffs)
+    t_nucbrk = search_frames[jump_idx + 1]
+
+    # Define post-NEB window
+    front_start = t_nucbrk + 2
+
+    front_len = int(
+        (t_max - front_start) / 4
+    )
+
+    front_end = front_start + front_len
+
+    front_mask = (
+        (frames >= front_start) &
+        (frames <= front_end)
+    )
+
+    # Define matched pre-NEB window
+    back_end = t_nucbrk - 4
+    back_start = back_end - front_len
+
+    back_mask = (
+        (frames >= back_start) &
+        (frames <= back_end)
+    )
+
+    # Ensure enough frames
+    if (
+        np.sum(front_mask) < min_seg or
+        np.sum(back_mask) < min_seg
+    ):
+        return nan_return
+
+    # Extract derivative traces
+    rate_front = group.loc[
+        front_mask,
+        "cycb_deg_rate"
+    ].to_numpy()
+
+    rate_back = group.loc[
+        back_mask,
+        "cycb_deg_rate"
+    ].to_numpy()
+
+    # remove NaNs/infs
+    rate_front = rate_front[np.isfinite(rate_front)]
+    rate_back = rate_back[np.isfinite(rate_back)]
+
+    if (
+        len(rate_front) < min_seg or
+        len(rate_back) < min_seg
+    ):
+        return nan_return
+
+    ksynth_front = -1*np.mean(rate_front)
+    ksynth_back = -1*np.mean(rate_back)
+
+    std_front = -1*np.std(rate_front)
+    std_back = -1*np.std(rate_back)
+
+
+    return pd.Series(
+        [
+            t_nucbrk,
+            ksynth_back,
+            ksynth_front,
+            std_back,
+            std_front,
+            back_start,
+            back_end,
+            front_start,
+            front_end,
+            len(rate_back),
+            len(rate_front)
+        ],
+        index=return_index
+    )
 
 
 def add_addl_metrics(
@@ -417,23 +649,16 @@ def add_addl_metrics(
         .transform(lambda x: -1*np.gradient(x))
     )
 
-    df_agg["area_norm"] = (
-        df_agg["cell_area"] / 
-        df_agg.groupby(["cell_id", "date", "well"], sort=False)["cell_area"].transform('max')
+    df_agg["area_smoothed"] = (
+        df_agg
+        .groupby(["cell_id", "date", "well"], sort=False)["cell_area"]
+        .transform(lambda x: denoise_tv_chambolle(x*0.3387**2, weight = 50))
     )
 
-    df_agg["cycb_corr"] = df_agg['cycb_intensity'] * df_agg['area_norm']
-
-    df_agg["cycb_corr_smoothed"] = (
+    df_agg["area_derivative"] = (
         df_agg
-        .groupby(["cell_id", "date", "well"], sort=False)["cycb_corr"]
-        .transform(lambda x: denoise_tv_chambolle(x, weight = 5))
-    )
-    
-    df_agg["cycb_corr_deg_rate"] = (
-        df_agg
-        .groupby(["cell_id", "date", "well"], sort=False)["cycb_corr_smoothed"]
-        .transform(lambda x: -1*np.gradient(x))
+        .groupby(["cell_id", "date", "well"], sort=False)["area_smoothed"]
+        .transform(lambda x: np.gradient(x))
     )
 
     df_agg["semantic_contig"] = (
@@ -470,23 +695,20 @@ def add_addl_metrics(
     )
     df_agg_qc = df_agg_qc.merge(deg_info, on=["date", "well", "cell_id"], how="left")
 
-    # 5. Merge max_cycb_frame back into df_agg early so we can calculate frames_from_max
-    df_agg = df_agg.merge(
-        df_agg_qc[["date", "well", "cell_id", "max_cycb_frame"]], 
-        on=["date", "well", "cell_id"], 
-        how="left"
+    jump_info = (
+        df_agg.groupby(["date", "well", "cell_id"])
+        .apply(area_jump_statistics, include_groups=False)
+        .reset_index()
     )
-    
-    # 6. Calculate relative time BEFORE applying the new synthesis function
-    df_agg["frames_from_max"] = df_agg["frame"] - df_agg["max_cycb_frame"]
+    df_agg_qc = df_agg_qc.merge(jump_info, on=["date", "well", "cell_id"], how="left")
 
-    # 7. Generate baseline synthesis rate info
     synth_info = (
         df_agg.groupby(["date", "well", "cell_id"])
-        .apply(synth_rate_statistics, include_groups=False)
+        .apply(lambda g: synth_rate_statistics(g, df_agg_qc))
         .reset_index()
     )
     df_agg_qc = df_agg_qc.merge(synth_info, on=["date", "well", "cell_id"], how="left")
+
 
     return df_agg, df_agg_qc
 
