@@ -353,52 +353,280 @@ def cycb_chromatin_batch_analyze(
                 writer, sheet_name="analysis_config", index=False
             )
 
+def cycb_batch_analyze_nochrom(
+    positions: list,
+    analysis_paths: list,
+    instance_paths: list,
+    frame_interval_minutes: float = 4.0,
+    version: Optional[str] = None
+) -> None:
+    
+    """
+    Batch analyze GFP data only for multiple positions.
+    --------------------------------------------------------------------
+    INPUTS:
+        positions: list, position identifiers
+        analysis_paths: list, paths to analysis Excel files
+        instance_paths: list, paths to instance movie files
+        frame_interval_minutes: float, time between frames in minutes
+    OUTPUTS:
+        None (saves Excel files to disk)
+    """
+
+    for name_stub, analysis_path, instance_path in zip(
+        positions,
+        analysis_paths,
+        instance_paths
+    ):
+
+        save_dir = os.path.dirname(analysis_path)
+        if not os.path.isdir(save_dir):
+            save_dir = os.getcwd()
+
+        try:
+            analysis_df = pd.read_excel(analysis_path)
+
+        except FileNotFoundError:
+            print(f"Could not load files for {analysis_path}")
+            continue
+
+        analysis_df.replace([np.inf, -np.inf], np.nan, inplace=True)
+        analysis_df.dropna(inplace=True)
+
+        print(f"Working on position: {name_stub}")
+
+        (
+            intensity_traces,
+            semantic_traces,
+            frame_traces,
+            dead_traces,
+            cell_area_traces,
+            ids
+        ) = retrieve_traces(
+            analysis_df,
+            "GFP",
+            int(frame_interval_minutes)
+        )
+
+        degradation_data = pd.DataFrame({
+            "cell_id": [],
+            "frame": [],
+            "cycb_intensity": [],
+            "semantic_smoothed": [],
+            "cell_area": [],
+
+            # chromatin placeholders
+            "u_area": [],
+            "u_area_intensity": [],
+            "a_area": [],
+            "a_area_intensity": [],
+            "t_area": [],
+            "t_area_intensity": [],
+            "mtphs_plate_width": [],
+            "u_chrom_num": [],
+            "u_chrom_num_low": [],
+            "u_chrom_num_high": [],
+        })
+
+        cell_summary_data = []
+
+        for i, cell_id in enumerate(ids):
+
+            num_dead_flags = np.sum(
+                semantic_traces[i] * dead_traces[i]
+            )
+
+            time_in_mitosis = np.sum(
+                semantic_traces[i]
+            )
+
+            peaks, range_, hysteresis = validate_cyclin_b_trace(
+                intensity_traces[i]
+            )
+
+            ends_in_mitosis = (
+                semantic_traces[i][-1] == 1
+            )
+
+            frames = frame_traces[i]
+            n = len(frames)
+
+            nan_trace = [np.nan] * n
+
+            cell_data = {
+                "cell_id": [cell_id] * n,
+                "frame": frames,
+                "cycb_intensity": intensity_traces[i],
+                "semantic_smoothed": semantic_traces[i],
+                "cell_area": cell_area_traces[i],
+
+                # placeholder chromatin metrics
+                "u_area": nan_trace,
+                "u_area_intensity": nan_trace,
+                "a_area": nan_trace,
+                "a_area_intensity": nan_trace,
+                "t_area": nan_trace,
+                "t_area_intensity": nan_trace,
+                "mtphs_plate_width": nan_trace,
+                "u_chrom_num": nan_trace,
+                "u_chrom_num_low": nan_trace,
+                "u_chrom_num_high": nan_trace,
+            }
+
+            degradation_data = pd.concat(
+                [degradation_data, pd.DataFrame(cell_data)],
+                ignore_index=True
+            )
+
+            cell_summary_data.append({
+                "cell_id": cell_id,
+                "track_len": len(frames),
+                "track_start": frames[0],
+                "track_end": frames[-1],
+                "plate_removal_freq": np.nan,
+                "num_dead_flags": num_dead_flags,
+                "peaks_criterion": peaks,
+                "range_criterion": range_,
+                "hysteresis_criterion": hysteresis,
+                "time_in_mitosis": time_in_mitosis,
+                "ends_in_mitosis": ends_in_mitosis
+            })
+
+        cell_summary_df = pd.DataFrame(cell_summary_data)
+
+        analysis_info = pd.DataFrame({
+            "instance_path": [instance_path],
+            "analysis_path": [analysis_path],
+            "chromatin_path": [None],
+            "frame_interval_minutes": [frame_interval_minutes],
+            "n_cells": [len(ids)],
+            "total_frames": [len(degradation_data)],
+        })
+
+        if version:
+            name_stub += f"_{version}"
+
+        save_path = os.path.join(
+            save_dir,
+            f"{name_stub}_cycb_only.xlsx"
+        )
+
+        with pd.ExcelWriter(save_path, engine="openpyxl") as writer:
+
+            degradation_data.to_excel(
+                writer,
+                sheet_name="degradation_data",
+                index=False
+            )
+
+            cell_summary_df.to_excel(
+                writer,
+                sheet_name="cell_summary",
+                index=False
+            )
+
+            analysis_info.to_excel(
+                writer,
+                sheet_name="analysis_config",
+                index=False
+            )
 
 
 if __name__ == "__main__":
 
     version = '0.3'
+
     root_dir = Path("/nfs/turbo/umms-ajitj/anishjv/cyclinb_analysis/20250621-cycb-noc")
+
     inference_dirs = [
         obj.path
         for obj in os.scandir(root_dir)
         if "_inference" in obj.name and obj.is_dir()
     ]
+
     analysis_paths = []
     instance_paths = []
     chromatin_paths = []
     positions = []
+
+    has_chromatin = True
+
     for dir in inference_dirs:
+
         name_stub = re.search(
-            r"[A-H]([1-9]|[0][1-9]|[1][0-2])_s(\d{2}|\d{1})", str(dir)
+            r"[A-H]([1-9]|[0][1-9]|[1][0-2])_s(\d{2}|\d{1})",
+            str(dir)
         ).group()
-        name_stub = str(name_stub) #temporary (removed + '-')
+
+        name_stub = str(name_stub)
+
         an_paths = glob.glob(f"{dir}/*analysis.xlsx")
         inst_paths = glob.glob(f"{dir}/*instance_movie.tif")
+
         chrom_paths = [
             path
             for path in glob.glob(f"{root_dir}/*Texas Red.tif")
             if str(name_stub + '_') in path
         ]
+
+        # Detect whether chromatin exists globally
+        if len(chrom_paths) == 0:
+            has_chromatin = False
+
         analysis_paths += an_paths
         instance_paths += inst_paths
         chromatin_paths += chrom_paths
         positions.append(name_stub)
 
-    try:
-        assert len(analysis_paths) == len(instance_paths) == len(chromatin_paths)
-    except AssertionError:
-        print("Files to analyze not organized properly")
-        print("Analysis paths", len(analysis_paths))
-        print("Instance paths", len(instance_paths))
-        print("Chromatin paths", len(chromatin_paths))
-        sys.exit(1)
-    
-    # Use default configuration
-    cycb_chromatin_batch_analyze(
-        positions, analysis_paths, instance_paths, chromatin_paths,
-        frame_interval_minutes=4.0, version=version
-    )
+    # Run appropriate pipeline
+    if has_chromatin:
+
+        try:
+            assert (
+                len(analysis_paths) ==
+                len(instance_paths) ==
+                len(chromatin_paths)
+            )
+
+        except AssertionError:
+            print("Files to analyze not organized properly")
+            print("Analysis paths", len(analysis_paths))
+            print("Instance paths", len(instance_paths))
+            print("Chromatin paths", len(chromatin_paths))
+            sys.exit(1)
+
+        print("Running chromatin-aware analysis")
+
+        cycb_chromatin_batch_analyze(
+            positions,
+            analysis_paths,
+            instance_paths,
+            chromatin_paths,
+            frame_interval_minutes=4.0,
+            version=version
+        )
+
+    else:
+
+        try:
+            assert len(analysis_paths) == len(instance_paths)
+
+        except AssertionError:
+            print("Files to analyze not organized properly")
+            print("Analysis paths", len(analysis_paths))
+            print("Instance paths", len(instance_paths))
+            sys.exit(1)
+
+        print("No chromatin files detected")
+        print("Running CycB-only analysis")
+
+        cycb_batch_analyze_nochrom(
+            positions,
+            analysis_paths,
+            instance_paths,
+            frame_interval_minutes=4.0,
+            version=version
+        )
 
     """
     Example with custom configuration for different experimental conditions

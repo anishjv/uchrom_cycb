@@ -8,12 +8,11 @@ import math
 import sys
 sys.path.append('/Users/whoisv/')
 from uchrom_cycb.changept import deriv_changept
-from scipy.ndimage import binary_dilation, median_filter
+from scipy.ndimage import binary_dilation
 from skimage.restoration import denoise_tv_chambolle
-from scipy.signal import peak_widths, find_peaks, peak_prominences
+from scipy.signal import peak_widths, find_peaks
+
 import warnings
-from scipy.optimize import curve_fit
-from scipy.special import erf
 warnings.filterwarnings("ignore", message="some peaks have a prominence of 0")
 warnings.filterwarnings("ignore", message="some peaks have a width of 0")
 
