@@ -12,6 +12,8 @@ from scipy.ndimage import binary_dilation, median_filter
 from skimage.restoration import denoise_tv_chambolle
 from scipy.signal import peak_widths, find_peaks, peak_prominences
 import warnings
+from scipy.optimize import curve_fit
+from scipy.special import erf
 warnings.filterwarnings("ignore", message="some peaks have a prominence of 0")
 warnings.filterwarnings("ignore", message="some peaks have a width of 0")
 
@@ -152,40 +154,39 @@ def aggregate_clean_dfs(
         
     return df_agg_c, df_agg_qc
 
+
 def cp_statistics(
-    group:pd.Grouper, 
-    min_prominence:float=0.25, 
-    rel_height:float=0.9, 
-    dilate:bool=False
-    ) -> pd.Series:
+    group: pd.DataFrame,
+    min_prominence: float = 0.25,
+    rel_height: float = 0.9,
+    dilate: bool = False
+) -> pd.Series:
 
-    """
-    Wrapper to handle pandas groups and return 'frame' of the changepoint and CycB at changept
-    NOTE: params are correct for non time-corrected d/dt traces, units = [intensity/4min]
-    -------------------------------------------------------------------------------------------
-    INPUTS:
-        group: pd.Grouper, grouped (by cell) df_agg from aggregate_clean_dfs()
-        min_prominence: float, minumum prominence to be considered a peak
-        rel_height: float, percentage of peak height to traverse down to be considered the peak's "base"
-        dilate: bool, whether or not to extent semantic smoothed, guards against Cell-APP ending mitosis early
-    OUTPUTS:
-        pd.Series containing:
-            cp_frame: int, frame of fast phase onset
-            cp_intensity: float, Cyclin B intensity at frame of fast phase onset
-    """
+    index = [
+            "cp_frame",
+            "cp_intensity",
+            "fast_phs_deg_rate",
+        ]
 
-    index = ["cp_frame", "cp_intensity", "fast_phs_deg_rate"]
+    group = group.sort_values("frame").reset_index(drop=True)
+    sem_mask = group["semantic_contig"].values.astype(bool)
 
-    group = group.sort_values("frame")
     if dilate:
-        mask = group["semantic_contig"].values.astype(bool)
-        mask = binary_dilation(mask, iterations=20)
-        active_phase = group[mask]
-    else:
-        active_phase = group[group["semantic_contig"] == 1]
+        sem_mask = binary_dilation(sem_mask, iterations=20)
+    sem_indices = np.flatnonzero(sem_mask)
+
+    if len(sem_indices) == 0:
+        return pd.Series([np.nan] * len(index), index=index)
+
+    start_idx = sem_indices[0]
+    end_idx = sem_indices[-1] 
+    mid_idx = (start_idx + end_idx) // 2
+    search_end = min(end_idx + 25, len(group) - 1)
+
+    active_phase = group.iloc[mid_idx:search_end + 1]
 
     if active_phase.empty or "cycb_deg_rate" not in active_phase:
-        return pd.Series([np.nan, np.nan, np.nan], index=index)
+        return pd.Series([np.nan] * len(index), index=index)
 
     deriv = active_phase["cycb_deg_rate"].to_numpy()
 
@@ -196,15 +197,20 @@ def cp_statistics(
     )
 
     if cp_idx is None or peak_idx is None:
-        return pd.Series([np.nan, np.nan, np.nan], index=index)
+        return pd.Series([np.nan] * len(index), index=index)
 
     cp_row = active_phase.iloc[cp_idx]
     peak_value = deriv[peak_idx]
 
     return pd.Series(
-        [cp_row["frame"], cp_row["cycb_intensity"], peak_value],
+        [
+            cp_row["frame"],
+            cp_row["cycb_intensity"],
+            peak_value,
+        ],
         index=index
     )
+
 
 def area_jump_statistics(
     group: pd.DataFrame,
@@ -551,7 +557,7 @@ def synth_rate_statistics(group, df_agg_qc, min_seg=3):
     front_start = t_nucbrk + 2
 
     front_len = int(
-        (t_max - front_start) / 4
+        (t_max - front_start) / 3
     )
 
     front_end = front_start + front_len

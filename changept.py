@@ -64,7 +64,7 @@ def changept(curve: npt.NDArray, search_dist: Optional[int]=1):
 def deriv_changept(
     deriv:npt.NDArray, 
     min_prominence:float=0.25, 
-    rel_height:float=0.9
+    rel_height:float=0.90
     ) -> Tuple[int, int]:
 
     '''
@@ -80,29 +80,65 @@ def deriv_changept(
         cp: int, index at which Cyclin B trace enters fast degradation phase
         main_peak_index, index of true derivative peak
     '''
-
-    offset = int((1/2) * deriv.shape[0])
-    deriv_slice = deriv[offset:]
     
     peaks, props = find_peaks(
-        deriv_slice, 
+        deriv, 
         prominence=min_prominence,
     )
     
     if len(peaks) == 0:
         return None, None
     
-    # We only care about the last peak (the terminal fast regime)
-    main_peak_slice_idx = [peaks[-1]]
+    heights = deriv[peaks]
+    max_height = np.max(heights)
+    thresh = 0.75 * max_height
+
+    # Peaks within 75% of tallest
+    valid = peaks[heights >= thresh]
+
+    # len(valid==0) occurs if max_height is negative; very rare
+    if len(valid) == 0:
+        print(f'No valid peaks, {max_height}')
+        main_peak_idx = peaks[np.argmax(heights)]
+    else:
+        # take LAST in time among qualifying peaks
+        main_peak_idx = valid[-1]
+
     
     # Calculate widths at a specific relative height
     # This returns: (widths, width_heights, left_ips, right_ips)
     # left_ips are the interpolated x-positions of the left side of the peak
-    widths_data = peak_widths(deriv_slice, main_peak_slice_idx, rel_height=rel_height)
-    
-    cp_rel = widths_data[2][0] # The left_ips (interpolated left index)
-    main_peak_idx = main_peak_slice_idx[0] + offset
-    cp = int(cp_rel) + offset
+    # Calculate widths at a specific relative height
+    # This returns: (widths, width_heights, left_ips, right_ips)
+    # left_ips are the interpolated x-positions of the left side of the peak
+
+    # define local bounds
+    left = max(0, main_peak_idx - 10)
+    right = min(len(deriv), main_peak_idx + 10 + 1)
+
+    # local derivative segment
+    local_deriv = deriv[left:right]
+    # local peak index inside cropped window
+    local_peak_idx = main_peak_idx - left
+
+    # compute widths locally
+    widths_data = peak_widths(
+        local_deriv,
+        [local_peak_idx],
+        rel_height=rel_height
+    )
+
+    # convert local coordinate back to global index
+    cp = int(widths_data[2][0] + left)
+
+    left_ip_local = widths_data[2][0]
+    if np.isclose(left_ip_local, 0):
+        print(
+            f"peak_widths hit left window edge | "
+            f"peak={main_peak_idx} | "
+            f"window=[{left}, {right}) | "
+            f"rel_height={rel_height}"
+        )
     
     return cp, main_peak_idx
 
