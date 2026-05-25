@@ -11,6 +11,7 @@ from uchrom_cycb.changept import deriv_changept
 from scipy.ndimage import binary_dilation
 from skimage.restoration import denoise_tv_chambolle
 from scipy.signal import peak_widths, find_peaks
+from scipy.optimize import curve_fit
 
 import warnings
 warnings.filterwarnings("ignore", message="some peaks have a prominence of 0")
@@ -158,56 +159,113 @@ def cp_statistics(
     group: pd.DataFrame,
     min_prominence: float = 0.25,
     rel_height: float = 0.9,
-    dilate: bool = False
+    cp_remediate: bool = False,
 ) -> pd.Series:
 
     index = [
-            "cp_frame",
-            "cp_intensity",
-            "fast_phs_deg_rate",
-        ]
+        "cp_frame",
+        "cp_intensity",
+        "ap_frame",
+        "ap_intensity",
+        "fast_phs_frame",
+        "fast_phs_intensity",
+        "fast_phs_deg_rate",
+    ]
+
+    nan_series = pd.Series([np.nan] * len(index), index=index)
 
     group = group.sort_values("frame").reset_index(drop=True)
-    sem_mask = group["semantic_contig"].values.astype(bool)
 
-    if dilate:
-        sem_mask = binary_dilation(sem_mask, iterations=20)
+    sem_mask = group["semantic_contig"].values.astype(bool)
     sem_indices = np.flatnonzero(sem_mask)
 
     if len(sem_indices) == 0:
-        return pd.Series([np.nan] * len(index), index=index)
+        return nan_series
 
     start_idx = sem_indices[0]
-    end_idx = sem_indices[-1] 
-    mid_idx = (start_idx + end_idx) // 2
+    end_idx = sem_indices[-1]
+
+    half_idx = (start_idx + end_idx) // 2
+
+    # expand search window to prevent semantic cutoffs ruining detection
     search_end = min(end_idx + 25, len(group) - 1)
 
-    active_phase = group.iloc[mid_idx:search_end + 1]
+    active_phase = group.iloc[half_idx : search_end + 1]
 
     if active_phase.empty or "cycb_deg_rate" not in active_phase:
-        return pd.Series([np.nan] * len(index), index=index)
+        return nan_series
 
     deriv = active_phase["cycb_deg_rate"].to_numpy()
 
-    cp_idx, peak_idx = deriv_changept(
-        deriv,
-        min_prominence=min_prominence,
-        rel_height=rel_height
+    cp_idx, peak_idx, ap_idx = deriv_changept(
+        deriv, min_prominence=min_prominence, rel_height=rel_height
     )
 
-    if cp_idx is None or peak_idx is None:
-        return pd.Series([np.nan] * len(index), index=index)
+    if cp_idx is None or peak_idx is None or ap_idx is None:
+        return nan_series
 
-    cp_row = active_phase.iloc[cp_idx]
-    peak_value = deriv[peak_idx]
+    # Only attempt changepoint remediation if dilation is enabled
+    if cp_remediate:
+        # Check if the 5 frames preceding cp_idx have a negative mean degradation rate
+        # If so, cell likely died
+        start_lookback = max(0, cp_idx - 5)
+
+        if (
+            cp_idx > 0
+            and np.mean(deriv[start_lookback:cp_idx]) < 0
+        ):
+
+            # Find the "nearest" index *before* cp_idx where deriv > 0
+            prior_positive_indices = np.flatnonzero(deriv[:cp_idx] > 0)
+
+            if len(prior_positive_indices) >= 3:
+                cp_idx = prior_positive_indices[-3]
+
+            else:
+                cp_idx = np.nan
+
+            # Set peak and anaphase indices to NaN as the cell died
+            peak_idx = np.nan
+            ap_idx = np.nan
+
+    # Safely handle extraction for ap and peak rows since they could now be NaN
+    if pd.isna(peak_idx):
+        peak_frame = np.nan
+        peak_intensity = np.nan
+        peak_value = np.nan
+    else:
+        peak_row = active_phase.iloc[int(peak_idx)]
+        peak_frame = peak_row["frame"]
+        peak_intensity = peak_row["cycb_intensity"]
+        peak_value = deriv[int(peak_idx)]
+
+    if pd.isna(ap_idx):
+        ap_frame = np.nan
+        ap_intensity = np.nan
+    else:
+        ap_row = active_phase.iloc[int(ap_idx)]
+        ap_frame = ap_row["frame"]
+        ap_intensity = ap_row["cycb_intensity"]
+
+    if pd.isna(cp_idx):
+        cp_frame = np.nan
+        cp_intensity = np.nan
+    else:
+        cp_row = active_phase.iloc[int(cp_idx)]
+        cp_frame = cp_row["frame"]
+        cp_intensity = cp_row["cycb_intensity"]
 
     return pd.Series(
         [
-            cp_row["frame"],
-            cp_row["cycb_intensity"],
+            cp_frame,
+            cp_intensity,
+            ap_frame,
+            ap_intensity,
+            peak_frame,
+            peak_intensity,
             peak_value,
         ],
-        index=index
+        index=index,
     )
 
 
@@ -222,8 +280,8 @@ def area_jump_statistics(
     For each cell, defines a search window spanning from 2× mitotic duration before mitotic onset
     to the midpoint of mitosis, then identifies the largest negative excursion in area derivative
     (i.e., the steepest drop in area). The dominant peak is selected based on absolute height
-    (not prominence), and the onset/stabilization of the collapse are defined as the points where
-    the signal falls to 50% of peak height on the left and right flanks.
+    (not prominence), and the onset of the collapse is defined as the point where
+    the signal reaches 75% of peak height on the left flank.
 
     -------------------------------------------------------------------------------------------
     INPUTS:
@@ -238,13 +296,11 @@ def area_jump_statistics(
         pd.Series containing:
             t_areajump: int, frame corresponding to left 75% height crossing of dominant peak
                         (interpreted as onset of area collapse)
-            t_areastable: int, frame corresponding to right 50% height crossing of dominant peak
-                          (interpreted as post-collapse stabilization)
             jump_height: float, height of the detected peak in -area_derivative
                          (proxy for magnitude of area collapse)
     """
 
-    index = ["t_areajump", "t_areastable", "jump_height"]
+    index = ["t_areajump", "jump_height"]
 
     group = group.sort_values("frame").reset_index(drop=True)
 
@@ -256,7 +312,8 @@ def area_jump_statistics(
     # --- identify mitotic region ---
     mito_idx = np.where(sem == 1)[0]
     if len(mito_idx) == 0:
-        return pd.Series([np.nan, np.nan, np.nan], index=index)
+        return pd.Series([np.nan, np.nan], index=index)
+
     start_mito = mito_idx[0]
 
     # --- define search window ---
@@ -264,15 +321,16 @@ def area_jump_statistics(
     end_idx = np.argmax(cycb)
 
     if end_idx <= start_idx:
-        return pd.Series([np.nan, np.nan, np.nan], index=index)
+        return pd.Series([np.nan, np.nan], index=index)
 
     # invert to detect drops as peaks
     window_signal = -area_deriv[start_idx:end_idx]
 
     # --- peak detection (height-based) ---
     peaks, props = find_peaks(window_signal, height=min_height)
+
     if len(peaks) == 0:
-        return pd.Series([np.nan, np.nan, np.nan], index=index)
+        return pd.Series([np.nan, np.nan], index=index)
 
     heights = props["peak_heights"]
 
@@ -284,20 +342,17 @@ def area_jump_statistics(
     widths, width_heights, left_ips, right_ips = peak_widths(
         window_signal,
         [peak_idx],
-        rel_height=0.75 #X% of the way down
+        rel_height=0.75
     )
 
     left_ip = left_ips[0]
-    right_ip = right_ips[0]
 
     # --- map back to global indices ---
     global_left = int(np.floor(start_idx + left_ip))
-    global_right = int(np.ceil(start_idx + right_ip))
 
     return pd.Series(
         [
             frames[global_left],
-            frames[global_right],
             heights[best],
         ],
         index=index
@@ -352,28 +407,34 @@ def deg_rate_statistics(group: pd.DataFrame) -> pd.Series:
     deg_region = group[group["deg_semantic"] == 1]
     
     # Define the index once to keep it DRY (Don't Repeat Yourself)
-    stat_index = ["avg_deg_rate", "var_deg_rate", "min_deg_rate", "max_deg_rate", "range_deg_rate"]
+    stat_index = ["avg_deg_rate", "var_deg_rate", "min_deg_rate", "max_deg_rate"]
 
     # 2. Handle cases where no degradation window was identified
     # Added a third np.nan to match the new range_rate column
     if deg_region.empty or deg_region["cycb_deg_rate"].isna().all():
-        return pd.Series([np.nan, np.nan, np.nan, np.nan, np.nan], index=stat_index)
+        return pd.Series([np.nan, np.nan, np.nan, np.nan], index=stat_index)
 
     # 3. Calculate statistics
     avg_rate = deg_region["cycb_deg_rate"].mean()
     var_rate = deg_region["cycb_deg_rate"].var()
     max_rate = deg_region["cycb_deg_rate"].max()
     min_rate = deg_region["cycb_deg_rate"].min()
-    range_rate = max_rate - min_rate
 
     # Return all three
-    return pd.Series([avg_rate, var_rate, min_rate, max_rate, range_rate], index=stat_index)
+    return pd.Series([avg_rate, var_rate, min_rate, max_rate], index=stat_index)
 
 
 def add_deg_semantic(df_agg: pd.DataFrame, df_agg_qc: pd.DataFrame) -> pd.DataFrame:
     """
-    Creates  'deg_semantic' and 'deg_time' columns in df_agg based on max Cyclin B and changepoint frames.
-    deg_semantic == 1 for (max_cycb_frame < frame <= cp_frame)
+    Creates 'deg_semantic', 'deg_time', and 'deg_time_rel' columns.
+
+    Standard case:
+        deg_semantic == 1 for:
+            max_cycb_frame < frame < cp_frame
+
+    If ends_in_mitosis == 1:
+        deg_semantic == 1 for:
+            frame > max_cycb_frame through end of trace
     -------------------------------------------------------------------------------------------
     INPUTS:
         df_agg: pd.DataFrame, per-timepoint output of aggregate_clean_dfs()
@@ -384,32 +445,58 @@ def add_deg_semantic(df_agg: pd.DataFrame, df_agg_qc: pd.DataFrame) -> pd.DataFr
             max_cycb_intensity: float, Cyclin B at max_cycb_frame
     """
 
-    cell_keys = ["date", "well", "cell_id"]
-    bounds = df_agg_qc[cell_keys + ["max_cycb_frame", "cp_frame"]]
 
-    # 1. Merge bounds
+    cell_keys = ["date", "well", "cell_id"]
+
+    bounds = df_agg_qc[
+        cell_keys + ["max_cycb_frame", "cp_frame", "ends_in_mitosis"]
+    ]
+
+    # 1. Merge metadata
     df_merged = df_agg.merge(bounds, on=cell_keys, how="left")
 
-    # 2. Identify the degradation phase (semantic == 1)
-    df_merged["deg_semantic"] = (
-        (df_merged["frame"] > df_merged["max_cycb_frame"]) & 
+    # 2. Define degradation phase
+    normal_mask = (
+        (df_merged["frame"] > df_merged["max_cycb_frame"]) &
         (df_merged["frame"] < df_merged["cp_frame"])
+    )
+
+    mitotic_end_mask = (
+        (df_merged["ends_in_mitosis"] == 1) &
+        (df_merged["frame"] > df_merged["max_cycb_frame"])
+    )
+
+    df_merged["deg_semantic"] = (
+        normal_mask | mitotic_end_mask
     ).astype(int)
 
-    # 3. Calculate absolute time in phase (0 to N-1)
+    # 3. Absolute degradation time
     mask = df_merged["deg_semantic"] == 1
-    df_merged["deg_time"] = df_merged[mask].groupby(cell_keys).cumcount()
+
+    df_merged["deg_time"] = np.nan
+    df_merged.loc[mask, "deg_time"] = (
+        df_merged.loc[mask]
+        .groupby(cell_keys)
+        .cumcount()
+    )
+
     df_merged["deg_time"] = df_merged["deg_time"].fillna(0)
 
-    # 4. Calculate relative time in phase (0.0 to 1.0)
-    # We find the max deg_time for each cell and divide
-    group_max = df_merged.groupby(cell_keys)["deg_time"].transform("max")
-    
-    # We use .where to avoid division by zero if a phase is only 1 frame long
-    df_merged["deg_time_rel"] = (df_merged["deg_time"] / group_max).fillna(0)
+    # 4. Relative degradation time
+    group_max = (
+        df_merged
+        .groupby(cell_keys)["deg_time"]
+        .transform("max")
+    )
 
-    # 5. Clean up
-    return df_merged.drop(columns=["max_cycb_frame", "cp_frame"])
+    df_merged["deg_time_rel"] = (
+        df_merged["deg_time"] / group_max.where(group_max > 0)
+    ).fillna(0)
+
+    # 5. Cleanup
+    return df_merged.drop(
+        columns=["max_cycb_frame", "cp_frame", "ends_in_mitosis"]
+    )
 
 
 def compute_semantic_contig(df: pd.DataFrame) -> pd.Series:
@@ -453,6 +540,7 @@ def compute_semantic_contig(df: pd.DataFrame) -> pd.Series:
 
 
 def synth_rate_statistics(group, df_agg_qc, min_seg=3):
+    
     """
     Estimate Cyclin B synthesis/degradation rates using smoothed
     derivative measurements ('cycb_deg_rate') in matched windows
@@ -491,8 +579,6 @@ def synth_rate_statistics(group, df_agg_qc, min_seg=3):
             back_end
             front_start
             front_end
-            back_window_size
-            front_window_size
     """
 
     return_index = [
@@ -504,9 +590,7 @@ def synth_rate_statistics(group, df_agg_qc, min_seg=3):
         "back_start",
         "back_end",
         "front_start",
-        "front_end",
-        "back_window_size",
-        "front_window_size"
+        "front_end"
     ]
 
     nan_return = pd.Series(
@@ -603,12 +687,11 @@ def synth_rate_statistics(group, df_agg_qc, min_seg=3):
     ):
         return nan_return
 
-    ksynth_front = -1*np.mean(rate_front)
-    ksynth_back = -1*np.mean(rate_back)
+    ksynth_front = -1 * np.mean(rate_front)
+    ksynth_back = -1 * np.mean(rate_back)
 
-    std_front = -1*np.std(rate_front)
-    std_back = -1*np.std(rate_back)
-
+    std_front = -1 * np.std(rate_front)
+    std_back = -1 * np.std(rate_back)
 
     return pd.Series(
         [
@@ -620,16 +703,14 @@ def synth_rate_statistics(group, df_agg_qc, min_seg=3):
             back_start,
             back_end,
             front_start,
-            front_end,
-            len(rate_back),
-            len(rate_front)
+            front_end
         ],
         index=return_index
     )
 
 
 def add_addl_metrics(
-    df_agg: pd.DataFrame, df_agg_qc: pd.DataFrame, noc:Optional[bool]=False
+    df_agg: pd.DataFrame, df_agg_qc: pd.DataFrame, noc:Optional[bool]=False, rpe:Optional[bool]=False
     ) ->tuple[pd.DataFrame]:
 
     """
@@ -640,12 +721,13 @@ def add_addl_metrics(
         df_agg_qc: pd.DataFrame, per-cell output of aggregate_clean_dfs()
     """
 
-    to_dilate = False if not noc else True
+    cp_remediate = False if not noc else True
+    weight = 5 if not rpe else 10
 
     df_agg["cycb_smoothed"] = (
         df_agg
         .groupby(["cell_id", "date", "well"], sort=False)["cycb_intensity"]
-        .transform(lambda x: denoise_tv_chambolle(x, weight = 5))
+        .transform(lambda x: denoise_tv_chambolle(x, weight = weight))
     )
 
     df_agg["cycb_deg_rate"] = (
@@ -684,7 +766,7 @@ def add_addl_metrics(
     # 2. Get Changepoint Info (using your existing calculate_cp)
     cp_info = (
         df_agg.groupby(["date", "well", "cell_id"])
-        .apply(cp_statistics, dilate = to_dilate, include_groups=False)
+        .apply(cp_statistics, cp_remediate = cp_remediate, include_groups=False)
         .reset_index()
     )
     df_agg_qc = df_agg_qc.merge(cp_info, on=["date", "well", "cell_id"], how="left")

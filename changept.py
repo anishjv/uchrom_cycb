@@ -87,13 +87,13 @@ def deriv_changept(
     )
     
     if len(peaks) == 0:
-        return None, None
+        return None, None, None
     
     heights = deriv[peaks]
     max_height = np.max(heights)
-    thresh = 0.75 * max_height
+    thresh = 0.90 * max_height
 
-    # Peaks within 75% of tallest
+    # Peaks within 90% of tallest
     valid = peaks[heights >= thresh]
 
     # len(valid==0) occurs if max_height is negative; very rare
@@ -130,6 +130,7 @@ def deriv_changept(
 
     # convert local coordinate back to global index
     cp = int(widths_data[2][0] + left)
+    ap = int(widths_data[3][0] + left)
 
     left_ip_local = widths_data[2][0]
     if np.isclose(left_ip_local, 0):
@@ -140,7 +141,7 @@ def deriv_changept(
             f"rel_height={rel_height}"
         )
     
-    return cp, main_peak_idx
+    return cp, main_peak_idx, ap
 
 
 def validate_cyclin_b_trace(trace: np.ndarray):
