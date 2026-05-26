@@ -11,7 +11,6 @@ from typing import Optional
 import glob
 import re
 from segment_chromatin import unaligned_chromatin, ChromatinSegConfig
-from changept import validate_cyclin_b_trace
 import sys
 import h5py
 
@@ -155,17 +154,15 @@ def cycb_chromatin_batch_analyze(
     if config is None:
         config = ChromatinSegConfig()
 
-
     for name_stub, analysis_path, instance_path, chromatin_path in zip(
         positions, analysis_paths, instance_paths, chromatin_paths
     ):
-
 
         save_dir = os.path.dirname(analysis_path)
         if not os.path.isdir(save_dir):
             save_dir = os.getcwd()
         vis_dir = os.path.join(save_dir, "visualizations")
-        os.makedirs(vis_dir, exist_ok=True) 
+        os.makedirs(vis_dir, exist_ok=True)
 
         try:
             instance = tiff.imread(instance_path)
@@ -181,11 +178,11 @@ def cycb_chromatin_batch_analyze(
         analysis_df.dropna(inplace=True)
 
         print(f"Working on position: {name_stub}")
+
         intensity_traces, semantic_traces, frame_traces, dead_traces, cell_area_traces, ids = (
             retrieve_traces(analysis_df, "GFP", int(frame_interval_minutes))
         )
-    
-        # Initialize dataframe with empty lists for each column
+
         degradation_data = pd.DataFrame(
             {
                 "cell_id": [],
@@ -204,46 +201,39 @@ def cycb_chromatin_batch_analyze(
             }
         )
 
-        # Store cell-level summary data
         cell_summary_data = []
-        # Process each cell and extend the dataframe directly
+
         for i, cell_id in enumerate(ids):
 
-            # Computing some important per-cell statistics
-            #   1. Number of dead calls during mitosis
-            #   2. Time spent in mitosis
-            #   3. Heuristic Cyclin B validation
-            #   4. If the trace ends in mitosis
-            num_dead_flags = np.sum(semantic_traces[i]*dead_traces[i])
+            num_dead_flags = np.sum(semantic_traces[i] * dead_traces[i])
             time_in_mitosis = np.sum(semantic_traces[i])
-            peaks, range, hysteresis = validate_cyclin_b_trace(intensity_traces[i])
+
             ends_in_mitosis = (semantic_traces[i][-1] == 1)
-                
-            # Get chromatin segmentation data for this cell
+
             data_tuple = unaligned_chromatin(
                 cell_id, analysis_df, instance, chromatin, config=config
             )
 
             if data_tuple is None:
-                continue #skip the cell
+                continue
 
             (
-                u_area_trace, 
-                u_area_int_trace, 
-                u_num_trace, 
-                t_area_trace, 
-                t_area_int_trace, 
+                u_area_trace,
+                u_area_int_trace,
+                u_num_trace,
+                t_area_trace,
+                t_area_int_trace,
                 width_trace,
-                visualization_stacks, 
-                removal_freq 
-                ) = data_tuple
-
+                visualization_stacks,
+                removal_freq
+            ) = data_tuple
 
             u_num_trace = []
             u_num_low_trace = []
             u_num_high_trace = []
+
             for meas in u_area_trace:
-                meas *= 0.3387**2 #conversion to square microns
+                meas *= 0.3387**2
                 u_num, (u_num_low, u_num_high), _ = predict_integer_chromosomes(
                     meas,
                     96.44,
@@ -257,9 +247,8 @@ def cycb_chromatin_batch_analyze(
                 u_num_low_trace.append(u_num_low)
                 u_num_high_trace.append(u_num_high)
 
-            # Get the actual frames for this cell
             frames = frame_traces[i]
-            # Create data for this cell
+
             cell_data = {
                 "cell_id": [cell_id] * len(frames),
                 "frame": frames,
@@ -269,7 +258,7 @@ def cycb_chromatin_batch_analyze(
                 "u_area": u_area_trace,
                 "u_area_intensity": u_area_int_trace,
                 "a_area": np.asarray(t_area_trace) - np.asarray(u_area_trace),
-                "a_area_intensity": np.asarray(t_area_int_trace) - np.asarray(u_area_int_trace),
+                "a_area_intensity": np.asarray(t_area_int_trace) - np.asarray(u_area_trace),
                 "t_area": t_area_trace,
                 "t_area_intensity": t_area_int_trace,
                 "mtphs_plate_width": width_trace,
@@ -278,12 +267,11 @@ def cycb_chromatin_batch_analyze(
                 "u_chrom_num_high": u_num_high_trace,
             }
 
-            # Extend the dataframe with this cell's data
             degradation_data = pd.concat(
-                [degradation_data, pd.DataFrame(cell_data)], ignore_index=True
+                [degradation_data, pd.DataFrame(cell_data)],
+                ignore_index=True
             )
 
-            # Store cell-level summary data
             cell_summary_data.append(
                 {
                     "cell_id": cell_id,
@@ -292,26 +280,20 @@ def cycb_chromatin_batch_analyze(
                     "track_end": frames[-1],
                     "plate_removal_freq": removal_freq,
                     "num_dead_flags": num_dead_flags,
-                    "peaks_criterion": peaks,
-                    "range_criterion": range,
-                    "hysteresis_criterion": hysteresis,
                     "time_in_mitosis": time_in_mitosis,
                     "ends_in_mitosis": ends_in_mitosis
                 }
             )
 
-            file_path = os.path.join(vis_dir, f'cell_{cell_id}.h5') #for each cell
+            file_path = os.path.join(vis_dir, f'cell_{cell_id}.h5')
             with h5py.File(file_path, "w") as f:
                 for i, stack in enumerate(visualization_stacks):
-                    grp = f.create_group(f"cell_{i}") # for each stack type (should really have better names)
-                    for j, img in enumerate(stack):   # for each image in each stack
+                    grp = f.create_group(f"cell_{i}")
+                    for j, img in enumerate(stack):
                         grp.create_dataset(f'{j}', data=img, compression="gzip")
 
-
-        # Create cell summary dataframe
         cell_summary_df = pd.DataFrame(cell_summary_data)
 
-        # Create analysis info dataframe
         analysis_info = pd.DataFrame(
             {
                 "instance_path": [instance_path],
@@ -323,35 +305,26 @@ def cycb_chromatin_batch_analyze(
             }
         )
 
-        # Create config info dataframe separately
         if hasattr(config, "__dict__"):
             config_info = pd.DataFrame([config.__dict__])
         else:
             config_info = pd.DataFrame()
 
-        # Combine the dataframes
-        if not config_info.empty:
-            analysis_config_df = pd.concat([analysis_info, config_info], axis=1)
-        else:
-            analysis_config_df = analysis_info
+        analysis_config_df = (
+            pd.concat([analysis_info, config_info], axis=1)
+            if not config_info.empty else analysis_info
+        )
 
         if version:
             name_stub += f'_{version}'
+
         save_path = os.path.join(save_dir, f"{name_stub}_cycb_chromatin.xlsx")
+
         with pd.ExcelWriter(save_path, engine="openpyxl") as writer:
-            # Save main data in long format (similar to cellaap_analysis.py)
-            # Each row represents a (cell_id, frame) combination with all attributes as columns
-            degradation_data.to_excel(
-                writer, sheet_name="degradation_data", index=False
-            )
-
-            # Save cell-level summary data
+            degradation_data.to_excel(writer, sheet_name="degradation_data", index=False)
             cell_summary_df.to_excel(writer, sheet_name="cell_summary", index=False)
+            analysis_config_df.to_excel(writer, sheet_name="analysis_config", index=False)
 
-            # Save combined analysis and config metadata
-            analysis_config_df.to_excel(
-                writer, sheet_name="analysis_config", index=False
-            )
 
 def cycb_batch_analyze_nochrom(
     positions: list,
@@ -360,7 +333,7 @@ def cycb_batch_analyze_nochrom(
     frame_interval_minutes: float = 4.0,
     version: Optional[str] = None
 ) -> None:
-    
+
     """
     Batch analyze GFP data only for multiple positions.
     --------------------------------------------------------------------
@@ -414,8 +387,6 @@ def cycb_batch_analyze_nochrom(
             "cycb_intensity": [],
             "semantic_smoothed": [],
             "cell_area": [],
-
-            # chromatin placeholders
             "u_area": [],
             "u_area_intensity": [],
             "a_area": [],
@@ -440,13 +411,7 @@ def cycb_batch_analyze_nochrom(
                 semantic_traces[i]
             )
 
-            peaks, range_, hysteresis = validate_cyclin_b_trace(
-                intensity_traces[i]
-            )
-
-            ends_in_mitosis = (
-                semantic_traces[i][-1] == 1
-            )
+            ends_in_mitosis = (semantic_traces[i][-1] == 1)
 
             frames = frame_traces[i]
             n = len(frames)
@@ -459,8 +424,6 @@ def cycb_batch_analyze_nochrom(
                 "cycb_intensity": intensity_traces[i],
                 "semantic_smoothed": semantic_traces[i],
                 "cell_area": cell_area_traces[i],
-
-                # placeholder chromatin metrics
                 "u_area": nan_trace,
                 "u_area_intensity": nan_trace,
                 "a_area": nan_trace,
@@ -485,9 +448,6 @@ def cycb_batch_analyze_nochrom(
                 "track_end": frames[-1],
                 "plate_removal_freq": np.nan,
                 "num_dead_flags": num_dead_flags,
-                "peaks_criterion": peaks,
-                "range_criterion": range_,
-                "hysteresis_criterion": hysteresis,
                 "time_in_mitosis": time_in_mitosis,
                 "ends_in_mitosis": ends_in_mitosis
             })
@@ -506,30 +466,12 @@ def cycb_batch_analyze_nochrom(
         if version:
             name_stub += f"_{version}"
 
-        save_path = os.path.join(
-            save_dir,
-            f"{name_stub}_cycb_only.xlsx"
-        )
+        save_path = os.path.join(save_dir, f"{name_stub}_cycb_only.xlsx")
 
         with pd.ExcelWriter(save_path, engine="openpyxl") as writer:
-
-            degradation_data.to_excel(
-                writer,
-                sheet_name="degradation_data",
-                index=False
-            )
-
-            cell_summary_df.to_excel(
-                writer,
-                sheet_name="cell_summary",
-                index=False
-            )
-
-            analysis_info.to_excel(
-                writer,
-                sheet_name="analysis_config",
-                index=False
-            )
+            degradation_data.to_excel(writer, sheet_name="degradation_data", index=False)
+            cell_summary_df.to_excel(writer, sheet_name="cell_summary", index=False)
+            analysis_info.to_excel(writer, sheet_name="analysis_config", index=False)
 
 
 if __name__ == "__main__":

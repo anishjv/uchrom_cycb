@@ -8,34 +8,129 @@ import math
 import sys
 sys.path.append('/Users/whoisv/')
 from uchrom_cycb.changept import deriv_changept
-from scipy.ndimage import binary_dilation
 from skimage.restoration import denoise_tv_chambolle
 from scipy.signal import peak_widths, find_peaks
-from scipy.optimize import curve_fit
 
 import warnings
 warnings.filterwarnings("ignore", message="some peaks have a prominence of 0")
 warnings.filterwarnings("ignore", message="some peaks have a width of 0")
 
 
-def get_cycb_widths(group: pd.DataFrame) -> float:
+def validate_cyclin_b_trace(
+    trace: np.ndarray,
+    semantic: np.ndarray,
+):
     """
-    Calculates CycB peak width. Returns 10000.0 if no peak is found.
+    Validate whether a trace exhibits expected Cyclin B dynamics around the
+    semantic == 1 interval.
+    ---------------------------------------------------------------------------
+    INPUTS:
+        trace:
+            np.ndarray of Cyclin B intensities over time.
+
+        semantic:
+            np.ndarray of semantic state labels over time.
+            semantic == 1 is assumed to form one contiguous block of frames.
+
+    OUTPUTS:
+        peaks_criterion:
+            True if the maximum Cyclin B intensity occurs within the
+            semantic == 1 block.
+
+        range_criterion:
+            True if max(trace) - min(trace) > 10.
+
+        hysteresis_criterion:
+            True if the mean Cyclin B intensity in the 1-3 frames BEFORE the
+            semantic == 1 block is greater than the mean intensity in the
+            1-3 frames AFTER the semantic == 1 block.
+
+            Returns False if insufficient frames exist on either side.
     """
-    trace = group['cycb_intensity'].values
-    
-    # Handle empty, all-NaN, or constant traces to avoid PeakPropertyWarning
-    if len(trace) < 3 or np.all(np.isnan(trace)) or np.ptp(trace) == 0:
-        return 10000.0
-        
-    peak_pos = np.nanargmax(trace)
 
-    widths, _, _, _ = peak_widths(trace, [peak_pos], rel_height=0.25)
+    semantic_1_idx = np.where(semantic == 1)[0]
 
-    if int(widths[0]) <= 3:
-        return 10000.0
+    # semantic==1 block must exist
+    if len(semantic_1_idx) == 0:
+        return False, False, False
+
+    start = semantic_1_idx[0]
+    end = semantic_1_idx[-1]
+
+    # Criterion 1:
+    # Max Cyclin B occurs during semantic==1 block
+    max_frame = np.argmax(trace)
+    peaks_criterion = start <= max_frame <= end
+
+    # Criterion 2:
+    # Trace dynamic range > 10
+    trace_range = np.max(trace) - np.min(trace)
+    range_criterion = trace_range > 10
+
+    # Criterion 3:
+    # Mean before semantic==1 block > mean after block
+    n = len(trace)
+
+    pre_start = max(start - 16, 0)
+    pre_end = max(start - 10, 0)
+
+    post_start = min(end + 1, n)
+    post_end = min(end + 6, n)
+
+    valid_windows = (
+        (pre_end-pre_start) > 2 and
+        (post_end-post_start) > 2
+    )
+
+    if valid_windows:
+        pre_vals = trace[pre_start:pre_end]
+        post_vals = trace[post_start:post_end]
+
+        hysteresis_criterion = np.mean(pre_vals) > np.mean(post_vals)
     else:
-        return widths[0]
+        hysteresis_criterion = False
+
+    return peaks_criterion, range_criterion, hysteresis_criterion
+
+def compute_semantic_contig(df: pd.DataFrame) -> pd.Series:
+
+    """
+    Identifies the largest contiguous block of semantic_smoothed == 1 and
+    returns a binary indicator marking membership in that block.
+    -----------------------------------------------------------------------------
+    INPUTS:
+        df: pd.DataFrame
+            Must contain:
+                - 'semantic_smoothed' (binary or boolean-like)
+                - sorted or unsorted by frame (function handles sorting implicitly
+                  if needed upstream; assumes row order corresponds to time or
+                  has consistent indexing within a cell group)
+    OUTPUTS:
+        pd.Series (int)
+            Binary series of same length as df:
+                1 → frame belongs to the largest contiguous semantic == 1 block
+                0 → all other frames
+            If no semantic == 1 region exists, returns all zeros.
+    """
+
+    mask = df["semantic_smoothed"] == 1
+
+    if not mask.any():
+        return pd.Series(0, index=df.index)
+
+    block_id = (mask != mask.shift()).cumsum()
+
+    blocks = df[mask].groupby(block_id[mask])
+
+    if len(blocks) == 0:
+        return pd.Series(0, index=df.index)
+
+    largest_block = max(blocks, key=lambda x: len(x[1]))[1]
+
+    contig = pd.Series(0, index=df.index)
+    contig.loc[largest_block.index] = 1
+
+    return contig
 
 
 def aggregate_clean_dfs(
@@ -82,48 +177,64 @@ def aggregate_clean_dfs(
 
         df = pd.read_excel(f)
         df_qc = pd.read_excel(f, sheet_name=1)
+        
+        #TODO: rerun deg so that these columns don't exist
+        # Remove old columns first
+        cols_to_replace = [
+            "peaks_criterion",
+            "range_criterion",
+            "hysteresis_criterion",
+        ]
+
+        df_qc = df_qc.drop(
+            columns=[c for c in cols_to_replace if c in df_qc.columns]
+        )
 
         # Basic ID tagging
         for d in [df, df_qc]:
             d["date"], d["well"] = date, well
             d["date-well"] = d["date"] + d["well"].str[0]
 
+        # Compute largest contiguous mitotic region
+        df["semantic_contig"] = (
+            df
+            .groupby(["cell_id"], sort=False)
+            .apply(compute_semantic_contig, include_groups=False)
+            .reset_index(level=0, drop=True)
+        )
+
         # Feature Calculations
-        
-        # 1. Mitosis Exit Check
-        ends_in_mitosis = (
+        criteria = (
             df.sort_values(["cell_id", "frame"])
-            .groupby("cell_id")["semantic_smoothed"]
-            .last().eq(1)
+            .groupby("cell_id")
+            .apply(
+                lambda g: pd.Series(
+                    validate_cyclin_b_trace(
+                        trace=g["cycb_intensity"].values,
+                        semantic=g["semantic_contig"].values,
+                    ),
+                    index=[
+                        "peaks_criterion",
+                        "range_criterion",
+                        "hysteresis_criterion"
+                    ],
+                ), include_groups=False
+            )
+            .reset_index()
         )
-        df_qc["ends_in_mitosis"] = df_qc["cell_id"].map(ends_in_mitosis).fillna(False)
 
-        # 2. cellapp-start: Cyclin B Peak Sync Check
-        # Does the global CycB max occur while semantic_smoothed == 1?
-        # This guards against Cell-APP starting mitosis late
-        idx_max_cycb = df.dropna(subset=['cycb_intensity']).groupby('cell_id')['cycb_intensity'].idxmax()
-        cycb_max_is_mitotic = df.loc[idx_max_cycb].set_index('cell_id')['semantic_smoothed'].eq(1)
-        df_qc["cycb_max_in_mitosis"] = df_qc["cell_id"].map(cycb_max_is_mitotic).fillna(False)
-
-        # 3. cellapp-end: Cyclin B Decay Width Check (The Scipy Integration)
-        # Calculate the 'physical' width of the CycB peak per cell
-        # this guards against Cell-APP ending mitosis early
-        cycb_widths = (
-            df.groupby('cell_id')[['cycb_intensity']] # Explicitly select column
-            .apply(get_cycb_widths, include_groups=False) # Silence deprecation warning
-        )
-        df_qc["cycb_decay_width"] = df_qc["cell_id"].map(cycb_widths).fillna(0.0)
-
+        # Merge criteria into df_qc
+        df_qc = df_qc.merge(criteria, on="cell_id", how="left")
 
         QC_RULES = {
             "num_dead_flags": lambda d: d["num_dead_flags"] <= 5,
             "plate_gsk": lambda d: d["plate_removal_freq"] >= 0.5,
             "plate_noc": lambda d: d["plate_removal_freq"] < 0.5,
             "range_criterion": lambda d: d["range_criterion"].astype(int) == 1,
-            "exited_mitosis": lambda d: ~d["ends_in_mitosis"],
+            "exited_mitosis": lambda d: d["ends_in_mitosis"].astype(int) == 0,
             "time_in_mitosis_noc": lambda d: d["time_in_mitosis"] >= 40,
-            "cellapp_start": lambda d: d["cycb_max_in_mitosis"],
-            "cellapp_end": lambda d: (d["time_in_mitosis"] / d["cycb_decay_width"]) >= 0.75
+            "cellapp_start": lambda d: d["peaks_criterion"].astype(int) == 1,
+            "cellapp_end": lambda d: d["hysteresis_criterion"].astype(int) == 1,
         }
 
         qc_mask = pd.Series(True, index=df_qc.index)
@@ -499,48 +610,8 @@ def add_deg_semantic(df_agg: pd.DataFrame, df_agg_qc: pd.DataFrame) -> pd.DataFr
     )
 
 
-def compute_semantic_contig(df: pd.DataFrame) -> pd.Series:
-    """
-    Identifies the largest contiguous block of semantic_smoothed == 1 and
-    returns a binary indicator marking membership in that block.
-    -----------------------------------------------------------------------------
-    INPUTS:
-        df: pd.DataFrame
-            Must contain:
-                - 'semantic_smoothed' (binary or boolean-like)
-                - sorted or unsorted by frame (function handles sorting implicitly
-                  if needed upstream; assumes row order corresponds to time or
-                  has consistent indexing within a cell group)
-    OUTPUTS:
-        pd.Series (int)
-            Binary series of same length as df:
-                1 → frame belongs to the largest contiguous semantic == 1 block
-                0 → all other frames
-            If no semantic == 1 region exists, returns all zeros.
-    """
-
-    mask = df["semantic_smoothed"] == 1
-
-    if not mask.any():
-        return pd.Series(0, index=df.index)
-
-    block_id = (mask != mask.shift()).cumsum()
-
-    blocks = df[mask].groupby(block_id[mask])
-
-    if len(blocks) == 0:
-        return pd.Series(0, index=df.index)
-
-    largest_block = max(blocks, key=lambda x: len(x[1]))[1]
-
-    contig = pd.Series(0, index=df.index)
-    contig.loc[largest_block.index] = 1
-
-    return contig
-
-
 def synth_rate_statistics(group, df_agg_qc, min_seg=3):
-    
+
     """
     Estimate Cyclin B synthesis/degradation rates using smoothed
     derivative measurements ('cycb_deg_rate') in matched windows
@@ -710,7 +781,7 @@ def synth_rate_statistics(group, df_agg_qc, min_seg=3):
 
 
 def add_addl_metrics(
-    df_agg: pd.DataFrame, df_agg_qc: pd.DataFrame, noc:Optional[bool]=False, rpe:Optional[bool]=False
+    df_agg: pd.DataFrame, df_agg_qc: pd.DataFrame, noc:Optional[bool]=False, type:Optional[str]="none"
     ) ->tuple[pd.DataFrame]:
 
     """
@@ -722,7 +793,13 @@ def add_addl_metrics(
     """
 
     cp_remediate = False if not noc else True
-    weight = 5 if not rpe else 10
+    match type:
+        case "rpe":
+            weight = 10
+        case "oe":
+            weight = 100
+        case "none":
+            weight = 5
 
     df_agg["cycb_smoothed"] = (
         df_agg
@@ -746,13 +823,6 @@ def add_addl_metrics(
         df_agg
         .groupby(["cell_id", "date", "well"], sort=False)["area_smoothed"]
         .transform(lambda x: np.gradient(x))
-    )
-
-    df_agg["semantic_contig"] = (
-        df_agg
-        .groupby(["cell_id", "date", "well"], sort=False)
-        .apply(compute_semantic_contig)
-        .reset_index(level=[0,1,2], drop=True)
     )
 
     # 1. Get Peak Info
