@@ -958,6 +958,7 @@ def visualize_chromatin_hd5(
     frames: list[int],
     max_cells: int = 60,
     chunk_size: int = 12,
+    tail: bool = False,
 ):
     """
     Visualize chromatin time-series from an HDF5 cell stack, organized in chunks.
@@ -983,6 +984,9 @@ def visualize_chromatin_hd5(
         chunk_size : int, default=12
             Number of timepoints displayed per figure.
 
+        tail : bool, default=False
+            If True, display the final `max_cells` timepoints instead of the first.
+
     -------------------------------------------------------------------------------------------
     OUTPUTS:
         figs : list[matplotlib.figure.Figure]
@@ -994,7 +998,11 @@ def visualize_chromatin_hd5(
 
     with h5py.File(file_path, "r") as f:
         cell_groups = sorted(f.keys(), key=lambda x: int(x.split("_")[-1]))
-        n_cells = min(len(cell_groups), max_cells)
+        if tail:
+            cell_groups = cell_groups[-max_cells:]
+        else:
+            cell_groups = cell_groups[:max_cells]
+        n_cells = len(cell_groups)
         n_chunks = math.ceil(n_cells / chunk_size)
 
         figs = []
@@ -1016,7 +1024,8 @@ def visualize_chromatin_hd5(
                 ax.tick_params(left=False, bottom=False, labelleft=False)
                 for spine in ax.spines.values():
                     spine.set_visible(False)
-                ax.set_xlabel(frames[start + col], fontsize=12)
+                group_idx = int(name.split("_")[-1])
+                ax.set_xlabel(frames[group_idx], fontsize=12)
                 ax.xaxis.set_label_position("bottom")
 
             plt.tight_layout()
