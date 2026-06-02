@@ -24,10 +24,9 @@ import tifffile as tiff
 
 import sys
 sys.path.append('/Users/whoisv/')
-from uchrom_cycb.deg_analysis import save_chromatin_crops
+from uchrom_cycb.deg_analysis import save_chromatin_crops, validate_cyclin_b_trace
 
 _BORDER_DISK = disk(1)
-from uchrom_cycb.changept import validate_cyclin_b_trace
 from uchrom_cycb.extractRect import findRotMaxRect
 
 @dataclass
@@ -937,7 +936,7 @@ if __name__ == "__main__":
         dead_score = np.sum(semantic_smoothed * dead)
         corr_intensity = ((intensity - bkg) * shading) - offset
 
-        _, range_crit, _ = validate_cyclin_b_trace(corr_intensity)
+        _, range_crit, _ = validate_cyclin_b_trace(corr_intensity, semantic_smoothed)
 
         metaphase_frames = analysis_df.query(
             f"particle == {cell_id} and semantic_smoothed == 1"
