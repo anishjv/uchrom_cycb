@@ -13,7 +13,7 @@ from skimage.measure import label, regionprops
 from skimage.segmentation import clear_border
 from skimage.restoration import richardson_lucy
 import matplotlib.pyplot as plt
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from scipy.special import j1
 import cv2
 import os
@@ -25,6 +25,8 @@ import tifffile as tiff
 import sys
 sys.path.append('/Users/whoisv/')
 from uchrom_cycb.deg_analysis import save_chromatin_crops
+
+_BORDER_DISK = disk(1)
 from uchrom_cycb.changept import validate_cyclin_b_trace
 from uchrom_cycb.extractRect import findRotMaxRect
 
@@ -40,6 +42,16 @@ class ChromatinSegConfig:
     euler_threshold: float = -2 # can be no more than three holes in the metaphase plate
     truncate_z: Optional[float] = None
     degrade_img: Optional[bool] = False
+
+    psf: np.ndarray = field(default=None, init=False, repr=False)
+    top_hat_disk: np.ndarray = field(default=None, init=False, repr=False)
+
+    def __post_init__(self):
+        self.psf = airy_disk_psf(
+            NA=0.45, wavelength_nm=624, pixel_size_um=0.3387,
+            psf_size=self.psf_size,
+        )
+        self.top_hat_disk = disk(self.top_hat_radius)
 
 
 def airy_disk_psf(NA, wavelength_nm, pixel_size_um, psf_size=51, oversample=1):
@@ -144,7 +156,8 @@ def compute_cell_images(
     label_id: int,
     zoom_factor: float,
     config: Optional[ChromatinSegConfig] = None,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    skip_deconv: bool = False,
+) -> tuple[np.ndarray, Optional[np.ndarray], np.ndarray, Optional[np.ndarray]]:
     """
     Build zoomed mask, bbox and return (cell, tophat_cell, mask, deconv_cell) for a given frame/label.
     Processing pipeline: gaussian smoothing -> deconvolution -> top-hat filtering
@@ -156,11 +169,12 @@ def compute_cell_images(
         label_id: int, cell label ID
         zoom_factor: float, zoom factor for mask resizing
         config: Optional[ChromatinSegConfig], configuration parameters (default=None)
+        skip_deconv: bool, if True skip deconvolution and top-hat (non-mitotic frames)
     OUTPUTS:
         cell: np.ndarray, cropped chromatin image
-        tophat_cell: np.ndarray, top-hat filtered cell image (for segmentation)
+        tophat_cell: Optional[np.ndarray], top-hat filtered image, or None if skip_deconv=True
         mask: np.ndarray, cell mask
-        deconv_cell: np.ndarray, deconvolved cell image (for segmentation only, not intensity measurements)
+        deconv_cell: Optional[np.ndarray], deconvolved image, or None if skip_deconv=True
     """
     if config is None:
         config = ChromatinSegConfig()
@@ -173,29 +187,25 @@ def compute_cell_images(
         bbox_coords[0] : bbox_coords[1], bbox_coords[2] : bbox_coords[3]
     ]
 
-    # Get the cropped cell image
     rmin, rmax, cmin, cmax = bbox_coords
     cell = chromatin[frame, rmin:rmax, cmin:cmax]
-
-    # Processing pipeline for segmentation:
-    # 1. Gaussian smoothing to reduce noise
     cell = rescale_intensity(cell, out_range=(0, 1))
+
+    if skip_deconv:
+        return cell.astype('float32'), None, mask_cropped, None
+
     smoothed_cell = gaussian(cell, sigma=config.gaussian_sigma)
 
-    # 2. Deconvolution to improve resolution
+    # fall back to recomputing PSF only for unusually small crops
     min_im_dim = min(smoothed_cell.shape[0], smoothed_cell.shape[1])
-    psf = airy_disk_psf(
-        NA=0.45,
-        wavelength_nm=624,
-        pixel_size_um=0.3387,
-        psf_size=min(config.psf_size, min_im_dim),
-    )
-    deconv_cell = richardson_lucy(smoothed_cell, psf, num_iter=5)
+    if min_im_dim < config.psf_size:
+        psf = airy_disk_psf(NA=0.45, wavelength_nm=624, pixel_size_um=0.3387,
+                            psf_size=min_im_dim)
+    else:
+        psf = config.psf
 
-    # 3. Top-hat filtering on deconvolved image for better structure enhancement
-    tophat_cell = skimage.morphology.white_tophat(
-        deconv_cell, disk(config.top_hat_radius)
-    )
+    deconv_cell = richardson_lucy(smoothed_cell, psf, num_iter=5)
+    tophat_cell = skimage.morphology.white_tophat(deconv_cell, config.top_hat_disk)
 
     return cell.astype('float32'), tophat_cell.astype('float32'), mask_cropped, deconv_cell.astype('float32')
 
@@ -440,7 +450,7 @@ def segment_mask_unaligned(
 
     # 5. Consistent Post-processing
     # Apply border clearing to both outputs to ensure consistency
-    border_mask = binary_erosion(cell_mask, disk(1))
+    border_mask = binary_erosion(cell_mask, _BORDER_DISK)
     labeled = clear_border(labeled, mask=border_mask)
     total_chromatin_mask = clear_border(total_chromatin_mask.astype(bool), mask=border_mask)
 
@@ -571,7 +581,8 @@ def unaligned_chromatin(
         width = 0
 
         cell, tophat_cell, cell_mask, _ = compute_cell_images(
-            instance, chromatin, f, l, zoom_factor, config
+            instance, chromatin, f, l, zoom_factor, config,
+            skip_deconv=(semantic == 0),
         )
 
         if semantic == 1:
