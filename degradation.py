@@ -287,10 +287,9 @@ def cycb_chromatin_batch_analyze(
 
             file_path = os.path.join(vis_dir, f'cell_{cell_id}.h5')
             with h5py.File(file_path, "w") as f:
-                for i, stack in enumerate(visualization_stacks):
+                for i, img in enumerate(visualization_stacks):
                     grp = f.create_group(f"cell_{i}")
-                    for j, img in enumerate(stack):
-                        grp.create_dataset(f'{j}', data=img, compression="gzip")
+                    grp.create_dataset('0', data=img, compression="gzip")
 
         cell_summary_df = pd.DataFrame(cell_summary_data)
 

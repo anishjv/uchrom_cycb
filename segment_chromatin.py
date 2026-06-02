@@ -570,11 +570,11 @@ def unaligned_chromatin(
         t_area_int = 0.0
         width = 0
 
-        if semantic == 1:
-            cell, tophat_cell, cell_mask, _ = compute_cell_images(
-                instance, chromatin, f, l, zoom_factor, config
-            )
+        cell, tophat_cell, cell_mask, _ = compute_cell_images(
+            instance, chromatin, f, l, zoom_factor, config
+        )
 
+        if semantic == 1:
             removal_mask, width = determine_removal_mask(
                 tophat_cell, cell, cell_mask, config
             )
@@ -596,13 +596,12 @@ def unaligned_chromatin(
             )
 
             crop_stack = save_chromatin_crops(
-                cell,
-                tophat_cell,
-                cell_mask,
-                labeled_chromosomes,
-                removal_mask,
+                cell, cell_mask, labeled_chromosomes, removal_mask
             )
-            visualization_stacks.append(crop_stack)
+        else:
+            crop_stack = save_chromatin_crops(cell, cell_mask)
+
+        visualization_stacks.append(crop_stack)
 
         # Append results directly (no zip later)
         u_area_trace.append(u_area)

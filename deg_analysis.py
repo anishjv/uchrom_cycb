@@ -9,6 +9,7 @@ import sys
 sys.path.append('/Users/whoisv/')
 from uchrom_cycb.changept import deriv_changept
 from skimage.restoration import denoise_tv_chambolle
+from skimage.segmentation import find_boundaries
 from scipy.signal import peak_widths, find_peaks
 
 import warnings
@@ -871,116 +872,128 @@ def add_addl_metrics(
 
 def save_chromatin_crops(
     cell: np.ndarray,
-    tophat_cell: np.ndarray,
     cell_mask: np.ndarray,
-    labeled_chromosomes: np.ndarray,
-    removal_mask: np.ndarray,
-) -> List[np.ndarray]:
+    labeled_chromosomes: Optional[np.ndarray] = None,
+    removal_mask: Optional[np.ndarray] = None,
+) -> np.ndarray:
     """
-    Create a stack of chromatin crops for a single cell across metaphase timepoints.
-    ------------------------------------------------------------------------------------------------------
+    Create a single composited RGBA crop for one cell timepoint.
+    ---------------------------------------------------------------------------
     INPUTS:
-        cell: np.ndarray, raw grayscale crop of the cell
-        tophat_cell: np.ndarray, preprocessed cell image (unused as base; raw cell is used)
-        cell_mask: np.ndarray, binary mask of the cell
-        labeled_chromosomes: np.ndarray, labeled chromosome regions
-        removal_mask: np.ndarray, mask for removed regions
-    OUTPUTS:
-        crop_stack: list of np.ndarray containing:
-            [0] raw cell (grayscale)
-            [1] metaphase plate overlay (RGBA)
-            [2] colored overlay of unaligned chromosomes + cell mask (RGBA)
-    """
+        cell:
+            np.ndarray, float32 grayscale cell image in [0, 1].
 
-    from uchrom_cycb.segment_chromatin import get_largest_signal_regions
+        cell_mask:
+            np.ndarray, boolean cell boundary mask.
+
+        labeled_chromosomes:
+            Optional np.ndarray, labeled unaligned chromosome regions (mitotic
+            frames only). Pass None for non-mitotic frames.
+
+        removal_mask:
+            Optional np.ndarray, boolean mask covering the metaphase plate
+            (mitotic frames only). Pass None for non-mitotic frames.
+
+    OUTPUTS:
+        composite:
+            np.ndarray (H, W, 4) float32 RGBA composed of:
+                - grayscale base
+                - metaphase plate in transparent gray (if removal_mask given)
+                - per-chromosome colored overlays (if labeled_chromosomes given)
+                - cell boundary as a white outline
+    """
 
     H, W = cell.shape
-    raw_img = cell.copy()  # raw grayscale base
 
-    # Helper function for blending
     def blend_overlay(base_rgba, overlay_rgba):
-        """Alpha blend overlay_rgba onto base_rgba."""
         alpha = overlay_rgba[..., 3:4]
-        base_rgba[..., :3] = (1 - alpha) * base_rgba[..., :3] + alpha * overlay_rgba[
-            ..., :3
-        ]
-        base_rgba[..., 3] = np.clip(base_rgba[..., 3] + alpha[..., 0], 0, 1)
-        return base_rgba
+        blended = base_rgba.copy()
+        blended[..., :3] = (1 - alpha) * base_rgba[..., :3] + alpha * overlay_rgba[..., :3]
+        blended[..., 3] = np.clip(base_rgba[..., 3] + alpha[..., 0], 0, 1)
+        return blended
 
-    #  Metaphase overlay
-    labeled_regions, max_lbl = get_largest_signal_regions(tophat_cell, cell, cell_mask)
-    if max_lbl is not None:
-        metaphase_mask = labeled_regions == max_lbl
-    metaphase_overlay = np.zeros((H, W, 4), dtype=float)
-    if metaphase_mask is not None:
-        mask_rgba = np.zeros((H, W, 4), dtype=float)
-        mask_rgba[metaphase_mask.astype(bool)] = [0, 0, 1, 0.2]  # blue alpha 0.2
-        metaphase_overlay = blend_overlay(metaphase_overlay, mask_rgba)
+    # Grayscale base as RGBA (cell is already normalized to [0, 1])
+    composite = np.zeros((H, W, 4), dtype=float)
+    composite[..., :3] = cell[..., np.newaxis]
+    composite[..., 3] = 1.0
+
+    # Metaphase plate: transparent gray
     if removal_mask is not None:
         removal_rgba = np.zeros((H, W, 4), dtype=float)
-        removal_rgba[removal_mask.astype(bool)] = [1, 0, 0, 0.2]  # red alpha 0.2
-        metaphase_overlay = blend_overlay(metaphase_overlay, removal_rgba)
+        removal_rgba[removal_mask.astype(bool)] = [0.6, 0.6, 0.6, 0.3]
+        composite = blend_overlay(composite, removal_rgba)
 
-    #  Unaligned chromosomes overlay
-    unaligned_overlay = np.zeros((H, W, 4), dtype=float)
-    colors = [
-        [1, 0, 0, 0.2],
-        [0, 1, 0, 0.2],
-        [0, 0, 1, 0.2],
-        [1, 1, 0, 0.2],
-        [1, 0, 1, 0.2],
-        [0, 1, 1, 0.2],
-        [1, 0.5, 0, 0.2],
-        [0.5, 0, 1, 0.2],
-        [0, 0.5, 0, 0.2],
-        [0.5, 0.5, 0, 0.2],
-    ]
+    # Unaligned chromosomes overlay
+    if labeled_chromosomes is not None:
+        colors = [
+            [1, 0, 0, 0.2],
+            [0, 1, 0, 0.2],
+            [0, 0, 1, 0.2],
+            [1, 1, 0, 0.2],
+            [1, 0, 1, 0.2],
+            [0, 1, 1, 0.2],
+            [1, 0.5, 0, 0.2],
+            [0.5, 0, 1, 0.2],
+            [0, 0.5, 0, 0.2],
+            [0.5, 0.5, 0, 0.2],
+        ]
+        unique_labels = np.unique(labeled_chromosomes[labeled_chromosomes > 0])
+        for i, lbl in enumerate(unique_labels):
+            mask = labeled_chromosomes == lbl
+            chrom_rgba = np.zeros((H, W, 4), dtype=float)
+            chrom_rgba[mask] = colors[i % len(colors)]
+            composite = blend_overlay(composite, chrom_rgba)
 
-    unique_labels = np.unique(labeled_chromosomes[labeled_chromosomes > 0])
-    for i, lbl in enumerate(unique_labels):
-        mask = labeled_chromosomes == lbl
-        chrom_rgba = np.zeros((H, W, 4), dtype=float)
-        chrom_rgba[mask] = colors[i % len(colors)]
-        unaligned_overlay = blend_overlay(unaligned_overlay, chrom_rgba)
+    # Cell boundary as white outline
+    border = find_boundaries(cell_mask.astype(bool), mode='inner')
+    border_rgba = np.zeros((H, W, 4), dtype=float)
+    border_rgba[border] = [1, 1, 1, 0.8]
+    composite = blend_overlay(composite, border_rgba)
 
-    # Overlay faint white cell outline last
-    cell_rgba = np.zeros((H, W, 4), dtype=float)
-    cell_rgba[cell_mask.astype(bool)] = [1, 1, 1, 0.1]
-    unaligned_overlay = blend_overlay(unaligned_overlay, cell_rgba)
-
-    return [raw_img, metaphase_overlay, unaligned_overlay]
+    return composite.astype(np.float32)
 
 
 def visualize_chromatin_hd5(
     file_path: str,
     frames: list[int],
-    num_frames_deg: int | None = None,
-    max_cells: int = 20,
-    chunk_size: int = 6,
+    max_cells: int = 60,
+    chunk_size: int = 12,
 ):
     """
-    Visualize chromatin crops from an HDF5 file, chunked for easier viewing.
+    Visualize chromatin time-series from an HDF5 cell stack, organized in chunks.
 
-    Displays:
-      Row 0: raw grayscale images
-      Row 1: metaphase overlay
-      Row 2: unaligned overlay + column number labels
+    Each HDF5 file contains cell groups (cell_0, cell_1, ...) with one composited
+    RGBA image per timepoint (all frames, not just mitotic ones). Each group has a
+    single dataset '0' containing the composited image.
 
-    Each figure shows up to `chunk_size` cells (columns).
+    Cells are displayed in groups of `chunk_size` columns per figure, one row per
+    chunk.
+
+    -------------------------------------------------------------------------------------------
+    INPUTS:
+        file_path : str
+            Path to HDF5 file containing cell image stacks.
+
+        frames : list[int]
+            Frame numbers for all timepoints stored in the file (one per cell group).
+
+        max_cells : int, default=60
+            Maximum number of timepoints to visualize from the file.
+
+        chunk_size : int, default=12
+            Number of timepoints displayed per figure.
+
+    -------------------------------------------------------------------------------------------
+    OUTPUTS:
+        figs : list[matplotlib.figure.Figure]
+            List of figure handles, one per chunk.
+
+    SIDE EFFECTS:
+        Displays figures interactively via plt.show().
     """
+
     with h5py.File(file_path, "r") as f:
         cell_groups = sorted(f.keys(), key=lambda x: int(x.split("_")[-1]))
-        num_images = len(cell_groups)
-
-        if num_frames_deg:
-            offset = (
-                num_frames_deg - num_images
-            )  # all mitotic timepoints get an image, but my degradation measurements only from the CycB peak onwards (a few timepoints into mitosis)
-            print(
-                f"Saved stacks contain {num_images} cells; "
-                f"only {num_frames_deg} were valid degradation frames. Adjusting indices accordingly."
-            )
-
         n_cells = min(len(cell_groups), max_cells)
         n_chunks = math.ceil(n_cells / chunk_size)
 
@@ -992,47 +1005,22 @@ def visualize_chromatin_hd5(
             chunk_groups = cell_groups[start:end]
             n_cols = len(chunk_groups)
 
-            fig, axes = plt.subplots(3, n_cols, figsize=(3 * n_cols, 9), squeeze=False)
+            fig, axes = plt.subplots(1, n_cols, figsize=(3 * n_cols, 3), squeeze=False)
 
             for col, name in enumerate(chunk_groups):
                 grp = f[name]
-                raw_img = grp["0"][()].astype(float) / 255
-                metaphase_overlay = grp["1"][()]
-                unaligned_overlay = grp["2"][()]
+                composite = grp["0"][()]
 
-                # Scale overlay RGB to darken
-                meta_disp = metaphase_overlay.copy()
-                meta_disp[..., :3] *= 3
-                unal_disp = unaligned_overlay.copy()
-                unal_disp[..., :3] *= 3
-
-                # Top row: raw
-                axes[0, col].imshow(raw_img, cmap="gray")
-                axes[0, col].axis("off")
-
-                # Middle row: metaphase overlay
-                axes[1, col].imshow(raw_img, cmap="gray")
-                axes[1, col].imshow(meta_disp)
-                axes[1, col].axis("off")
-
-                # Bottom row: unaligned overlay + label
-                ax = axes[2, col]
-                ax.imshow(raw_img, cmap="gray")
-                ax.imshow(unal_disp)
+                ax = axes[0, col]
+                ax.imshow(composite)
                 ax.tick_params(left=False, bottom=False, labelleft=False)
                 for spine in ax.spines.values():
                     spine.set_visible(False)
-                rel_label = start + col + offset
-                abs_label = frames[start+col]
-                label = f'{rel_label},{abs_label}'
-                ax.set_xlabel(
-                    label, 
-                    fontsize=16
-                    )
+                ax.set_xlabel(frames[start + col], fontsize=12)
                 ax.xaxis.set_label_position("bottom")
 
             plt.tight_layout()
-            plt.show()  # each chunk displays separately
+            plt.show()
             figs.append(fig)
 
         return figs
