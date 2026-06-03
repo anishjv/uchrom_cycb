@@ -958,7 +958,7 @@ def visualize_chromatin_hd5(
     frames: list[int],
     max_cells: int = 60,
     chunk_size: int = 12,
-    tail: bool = False,
+    center: Optional[int] = None,
 ):
     """
     Visualize chromatin time-series from an HDF5 cell stack, organized in chunks.
@@ -984,8 +984,10 @@ def visualize_chromatin_hd5(
         chunk_size : int, default=12
             Number of timepoints displayed per figure.
 
-        tail : bool, default=False
-            If True, display the final `max_cells` timepoints instead of the first.
+        center : Optional[int], default=None
+            Frame number to center the display window around. When provided,
+            displays `max_cells` timepoints centered on the group whose frame
+            number is closest to `center`.
 
     -------------------------------------------------------------------------------------------
     OUTPUTS:
@@ -997,11 +999,20 @@ def visualize_chromatin_hd5(
     """
 
     with h5py.File(file_path, "r") as f:
-        cell_groups = sorted(f.keys(), key=lambda x: int(x.split("_")[-1]))
-        if tail:
-            cell_groups = cell_groups[-max_cells:]
+        all_groups = sorted(f.keys(), key=lambda x: int(x.split("_")[-1]))
+
+        if center is not None:
+            center_pos = min(
+                range(len(all_groups)),
+                key=lambda i: abs(frames[int(all_groups[i].split("_")[-1])] - center),
+            )
+            half = max_cells // 2
+            lo = max(0, center_pos - half)
+            hi = min(len(all_groups), lo + max_cells)
+            lo = max(0, hi - max_cells)
+            cell_groups = all_groups[lo:hi]
         else:
-            cell_groups = cell_groups[:max_cells]
+            cell_groups = all_groups[:max_cells]
         n_cells = len(cell_groups)
         n_chunks = math.ceil(n_cells / chunk_size)
 
