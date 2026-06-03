@@ -161,7 +161,7 @@ def cycb_chromatin_batch_analyze(
         save_dir = os.path.dirname(analysis_path)
         if not os.path.isdir(save_dir):
             save_dir = os.getcwd()
-        vis_dir = os.path.join(save_dir, "visualizations")
+        vis_dir = os.path.join(save_dir, f"visualizations_{version}" if version else "visualizations")
         os.makedirs(vis_dir, exist_ok=True)
 
         try:
@@ -258,7 +258,7 @@ def cycb_chromatin_batch_analyze(
                 "u_area": u_area_trace,
                 "u_area_intensity": u_area_int_trace,
                 "a_area": np.asarray(t_area_trace) - np.asarray(u_area_trace),
-                "a_area_intensity": np.asarray(t_area_int_trace) - np.asarray(u_area_trace),
+                "a_area_intensity": np.asarray(t_area_int_trace) - np.asarray(u_area_int_trace),
                 "t_area": t_area_trace,
                 "t_area_intensity": t_area_int_trace,
                 "mtphs_plate_width": width_trace,
