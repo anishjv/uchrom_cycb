@@ -104,6 +104,14 @@ def deriv_changept(
         # take LAST in time among qualifying peaks
         main_peak_idx = valid[-1]
 
+    '''
+    if main_peak_idx in peaks:
+        peak_pos = np.where(peaks == main_peak_idx)[0][0]
+        print("Chosen peak prominence:", props["prominences"][peak_pos])
+    else:
+        print("Chosen peak was selected via fallback; prominence not directly available")
+    '''
+
     
     # Calculate widths at a specific relative height
     # This returns: (widths, width_heights, left_ips, right_ips)

@@ -58,7 +58,6 @@ def psuedo_cellapp_mask(
     max_area_lbl = labels[areas.index(max_area)]
     seg_max = seg_cleaned_labeled == max_area_lbl
 
-    # region properties of largest object
     props = regionprops(seg_max.astype(int))[0]
 
     theta = props.orientation        # radians
@@ -403,7 +402,7 @@ def run_pipeline(
     if config.degrade_img:
         cell = degrade_to_ixn(cell_3d)
     else:
-        cell = cell_3d
+        cell = rescale_intensity(cell_3d.astype('float32'), out_range=(0, 1))
 
     cell, tophat_cell, _ = compute_cell_images(cell) 
     mask = psuedo_cellapp_mask(tophat_cell, config)

@@ -959,6 +959,7 @@ def visualize_chromatin_hd5(
     max_cells: int = 60,
     chunk_size: int = 12,
     center: Optional[int] = None,
+    display_data: Optional[list[list]] = None,
 ):
     """
     Visualize chromatin time-series from an HDF5 cell stack, organized in chunks.
@@ -989,6 +990,12 @@ def visualize_chromatin_hd5(
             displays `max_cells` timepoints centered on the group whose frame
             number is closest to `center`.
 
+        display_data : Optional[list[list]], default=None
+            Additional data lists to show on the x-axis label alongside the frame
+            number. Each list must have the same length as `frames`. Float values
+            are rounded to the nearest integer. The x-axis label for each timepoint
+            will read: frame, val1, val2, ...
+
     -------------------------------------------------------------------------------------------
     OUTPUTS:
         figs : list[matplotlib.figure.Figure]
@@ -997,6 +1004,18 @@ def visualize_chromatin_hd5(
     SIDE EFFECTS:
         Displays figures interactively via plt.show().
     """
+
+    if display_data is not None:
+        for i, lst in enumerate(display_data):
+            if len(lst) != len(frames):
+                raise ValueError(
+                    f"display_data[{i}] has length {len(lst)} but frames has length {len(frames)}."
+                )
+
+    def _fmt(val):
+        if isinstance(val, float):
+            return str(round(val))
+        return str(val)
 
     with h5py.File(file_path, "r") as f:
         all_groups = sorted(f.keys(), key=lambda x: int(x.split("_")[-1]))
@@ -1036,7 +1055,11 @@ def visualize_chromatin_hd5(
                 for spine in ax.spines.values():
                     spine.set_visible(False)
                 group_idx = int(name.split("_")[-1])
-                ax.set_xlabel(frames[group_idx], fontsize=12)
+
+                label_parts = [str(frames[group_idx])]
+                if display_data is not None:
+                    label_parts += [_fmt(lst[group_idx]) for lst in display_data]
+                ax.set_xlabel(", ".join(label_parts), fontsize=12)
                 ax.xaxis.set_label_position("bottom")
 
             plt.tight_layout()

@@ -7,10 +7,10 @@ from typing import Optional, Tuple
 
 import skimage
 from skimage.exposure import rescale_intensity
-from skimage.morphology import disk, remove_small_objects, binary_erosion
+from skimage.morphology import disk, remove_small_objects, binary_erosion, binary_dilation
 from skimage.filters import threshold_otsu, gaussian, threshold_li
 from skimage.measure import label, regionprops
-from skimage.segmentation import clear_border
+from skimage.segmentation import clear_border, find_boundaries
 from skimage.restoration import richardson_lucy
 import matplotlib.pyplot as plt
 from dataclasses import dataclass, field
@@ -24,7 +24,7 @@ import tifffile as tiff
 
 import sys
 sys.path.append('/Users/whoisv/')
-from uchrom_cycb.deg_analysis import save_chromatin_crops, validate_cyclin_b_trace
+from uchrom_cycb.deg_analysis import save_chromatin_crops
 
 _BORDER_DISK = disk(1)
 from uchrom_cycb.extractRect import findRotMaxRect
@@ -39,6 +39,7 @@ class ChromatinSegConfig:
     min_chromatin_area: int = 20
     eccentricity_threshold: float = 0.7 #largest region must have eccentricty greater than threshold to be considered for metaphase plate detection
     euler_threshold: float = -2 # can be no more than three holes in the metaphase plate
+    border_fraction: float = 0.5
     truncate_z: Optional[float] = None
     degrade_img: Optional[bool] = False
 
@@ -456,6 +457,35 @@ def segment_mask_unaligned(
     return labeled, total_chromatin_mask
 
 
+def filter_plate_bleedout(
+    labeled: np.ndarray,
+    removal_mask: np.ndarray,
+    border_fraction: float = 0.5,
+) -> np.ndarray:
+    """
+    Remove labeled objects where too many border pixels are adjacent to the removal mask.
+    ---------------------------------------------------------------------------------------------------------------
+    INPUTS:
+        labeled: np.ndarray, labeled image of unaligned chromosomes (background = 0)
+        removal_mask: np.ndarray, boolean mask of the metaphase plate removal region
+        border_fraction: float, fraction of the object's total pixels whose border touches
+                         the removal mask, above which an object is considered a bleed-out (default=0.5)
+    OUTPUTS:
+        filtered: np.ndarray, labeled image with bleed-out objects removed (set to 0)
+    """
+    dilated_removal = binary_dilation(removal_mask, disk(1))
+    filtered = labeled.copy()
+
+    for lbl in np.unique(labeled[labeled > 0]):
+        obj_mask = labeled == lbl
+        perimeter = find_boundaries(obj_mask, mode='inner')
+        touching = np.sum(perimeter & dilated_removal)
+        if (touching / np.sum(obj_mask)) > border_fraction:
+            filtered[obj_mask] = 0
+
+    return filtered
+
+
 def segment_unaligned_chromosomes(
     cell: np.ndarray,
     tophat_cell: np.ndarray,
@@ -486,6 +516,7 @@ def segment_unaligned_chromosomes(
     labeled, total_chromatin_mask = segment_mask_unaligned(
         removal_mask, tophat_cell, cell_mask
     )
+    labeled = filter_plate_bleedout(labeled, removal_mask, config.border_fraction)
 
     # Compute total chromatin measurements from the mask
     total_chromatin_area = np.nansum(total_chromatin_mask)
