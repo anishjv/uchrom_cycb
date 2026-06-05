@@ -24,7 +24,7 @@ import tifffile as tiff
 
 import sys
 sys.path.append('/Users/whoisv/')
-from uchrom_cycb.deg_analysis import save_chromatin_crops
+from uchrom_cycb.deg_analysis import save_chromatin_sources
 
 _BORDER_DISK = disk(1)
 from uchrom_cycb.extractRect import findRotMaxRect
@@ -41,6 +41,7 @@ class ChromatinSegConfig:
     euler_threshold: float = -2 # can be no more than three holes in the metaphase plate
     bleedout_max_touch_ratio: float = 0.7
     bleedout_debug: bool = False
+    bleedout_connec: int = 2
     truncate_z: Optional[float] = None
     degrade_img: Optional[bool] = False
 
@@ -461,8 +462,8 @@ def segment_mask_unaligned(
 def filter_plate_bleedout(
     labeled: npt.NDArray,
     removal_mask: npt.NDArray,
-    max_touch_ratio: float = 0.7,
-    connectivity: int = 1,
+    max_touch_ratio: float = 1.0,
+    connectivity: int = 2,
     return_debug: bool = False,
 ):
     """
@@ -564,6 +565,7 @@ def segment_unaligned_chromosomes(
         labeled, removal_mask,
         max_touch_ratio=config.bleedout_max_touch_ratio,
         return_debug=config.bleedout_debug,
+        connectivity=config.bleedout_connec
     )
     if config.bleedout_debug:
         labeled, bleedout_debug = bleedout_result
@@ -689,11 +691,11 @@ def unaligned_chromatin(
                 cell, tophat_cell, removal_mask, cell_mask, config
             )
 
-            crop_stack = save_chromatin_crops(
+            crop_stack = save_chromatin_sources(
                 cell, cell_mask, labeled_chromosomes, removal_mask
             )
         else:
-            crop_stack = save_chromatin_crops(cell, cell_mask)
+            crop_stack = save_chromatin_sources(cell, cell_mask)
 
         visualization_stacks.append(crop_stack)
 

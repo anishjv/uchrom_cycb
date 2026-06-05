@@ -870,39 +870,78 @@ def add_addl_metrics(
 
     return df_agg, df_agg_qc
 
-def save_chromatin_crops(
+def save_chromatin_sources(
+    cell: np.ndarray,
+    cell_mask: np.ndarray,
+    labeled_chromosomes: Optional[np.ndarray] = None,
+    removal_mask: Optional[np.ndarray] = None,
+) -> dict:
+    """
+    Package the four source arrays for one cell timepoint as a dict of
+    minimally-typed arrays ready to write as named HDF5 datasets.
+    ---------------------------------------------------------------------------------------------------------------
+    Stores sources rather than a rendered composite so that the display is
+    lossless and re-analysis (e.g. filter_plate_bleedout) can run directly
+    off the HDF5 without recomputing from the raw movies. The composite is
+    fully recoverable from these arrays via render_chromatin_composite().
+    cell is stored as float16 (sufficient for [0, 1] data and half the size
+    of float32). Masks are stored as bool (gzip compresses sparse boolean
+    arrays very efficiently). labeled is stored as int16 (ample for any
+    realistic number of objects in a single crop).
+    ---------------------------------------------------------------------------------------------------------------
+    INPUTS:
+        cell: np.ndarray, float grayscale crop normalized to [0, 1]
+        cell_mask: np.ndarray, boolean cell boundary mask
+        labeled_chromosomes: Optional[np.ndarray], int labeled unaligned
+                             chromosome regions; None for non-mitotic frames
+        removal_mask: Optional[np.ndarray], boolean metaphase plate mask;
+                      None for non-mitotic frames
+    OUTPUTS:
+        src: dict mapping dataset name -> array at minimal dtype:
+             "cell"         -> float16 (always present)
+             "cell_mask"    -> bool    (always present)
+             "labeled"      -> int16   (present iff labeled_chromosomes is not None)
+             "removal_mask" -> bool    (present iff removal_mask is not None)
+    """
+    src = {
+        "cell":      cell.astype(np.float16),
+        "cell_mask": cell_mask.astype(bool),
+    }
+    if labeled_chromosomes is not None:
+        src["labeled"] = labeled_chromosomes.astype(np.int16)
+    if removal_mask is not None:
+        src["removal_mask"] = removal_mask.astype(bool)
+    return src
+
+
+def render_chromatin_composite(
     cell: np.ndarray,
     cell_mask: np.ndarray,
     labeled_chromosomes: Optional[np.ndarray] = None,
     removal_mask: Optional[np.ndarray] = None,
 ) -> np.ndarray:
     """
-    Create a single composited RGBA crop for one cell timepoint.
-    ---------------------------------------------------------------------------
+    Reconstruct the RGBA composite from source arrays saved by
+    save_chromatin_sources.
+    ---------------------------------------------------------------------------------------------------------------
+    This is a pure rendering function: it applies the same sequence of
+    alpha-blended overlays that save_chromatin_crops used to produce, so
+    the output is pixel-identical to what save_chromatin_crops would have
+    returned for the same inputs. Kept separate from save_chromatin_sources
+    so that storage and display concerns do not mix.
+    ---------------------------------------------------------------------------------------------------------------
     INPUTS:
-        cell:
-            np.ndarray, float32 grayscale cell image in [0, 1].
-
-        cell_mask:
-            np.ndarray, boolean cell boundary mask.
-
-        labeled_chromosomes:
-            Optional np.ndarray, labeled unaligned chromosome regions (mitotic
-            frames only). Pass None for non-mitotic frames.
-
-        removal_mask:
-            Optional np.ndarray, boolean mask covering the metaphase plate
-            (mitotic frames only). Pass None for non-mitotic frames.
-
+        cell: np.ndarray, float grayscale crop in [0, 1] (may be float16
+              as loaded from HDF5; imshow handles both)
+        cell_mask: np.ndarray, boolean cell boundary mask
+        labeled_chromosomes: Optional[np.ndarray], int labeled unaligned
+                             chromosome regions; None for non-mitotic frames
+        removal_mask: Optional[np.ndarray], boolean metaphase plate mask;
+                      None for non-mitotic frames
     OUTPUTS:
-        composite:
-            np.ndarray (H, W, 4) float32 RGBA composed of:
-                - grayscale base
-                - metaphase plate in transparent gray (if removal_mask given)
-                - per-chromosome colored overlays (if labeled_chromosomes given)
-                - cell boundary as a white outline
+        composite: np.ndarray (H, W, 4) float32 RGBA, identical to what
+                   the old save_chromatin_crops would have returned
     """
-
     H, W = cell.shape
 
     def blend_overlay(base_rgba, overlay_rgba):
@@ -964,9 +1003,12 @@ def visualize_chromatin_hd5(
     """
     Visualize chromatin time-series from an HDF5 cell stack, organized in chunks.
 
-    Each HDF5 file contains cell groups (cell_0, cell_1, ...) with one composited
-    RGBA image per timepoint (all frames, not just mitotic ones). Each group has a
-    single dataset '0' containing the composited image.
+    Each HDF5 file contains cell groups (cell_0, cell_1, ...) with named source
+    datasets per timepoint (all frames, not just mitotic ones). Every group has
+    'cell' (float16) and 'cell_mask' (bool); mitotic frames also have 'labeled'
+    (int16) and 'removal_mask' (bool). The composite is rendered at display time
+    via render_chromatin_composite, so the HDF5 is lossless and directly usable
+    for re-analysis.
 
     Cells are displayed in groups of `chunk_size` columns per figure, one row per
     chunk.
@@ -1047,7 +1089,11 @@ def visualize_chromatin_hd5(
 
             for col, name in enumerate(chunk_groups):
                 grp = f[name]
-                composite = grp["0"][()]
+                cell      = grp["cell"][()].astype(np.float32)
+                cell_mask = grp["cell_mask"][()].astype(bool)
+                labeled   = grp["labeled"][()].astype(np.int16)   if "labeled"      in grp else None
+                removal   = grp["removal_mask"][()].astype(bool)  if "removal_mask" in grp else None
+                composite = render_chromatin_composite(cell, cell_mask, labeled, removal)
 
                 ax = axes[0, col]
                 ax.imshow(composite)
