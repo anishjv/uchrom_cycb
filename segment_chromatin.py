@@ -7,7 +7,7 @@ from typing import Optional, Tuple
 
 import skimage
 from skimage.exposure import rescale_intensity
-from skimage.morphology import disk, remove_small_objects, binary_erosion, binary_dilation
+from skimage.morphology import disk, square, diamond, remove_small_objects, binary_erosion, binary_dilation
 from skimage.filters import threshold_otsu, gaussian, threshold_li
 from skimage.measure import label, regionprops
 from skimage.segmentation import clear_border, find_boundaries
@@ -39,7 +39,8 @@ class ChromatinSegConfig:
     min_chromatin_area: int = 20
     eccentricity_threshold: float = 0.7 #largest region must have eccentricty greater than threshold to be considered for metaphase plate detection
     euler_threshold: float = -2 # can be no more than three holes in the metaphase plate
-    border_fraction: float = 0.3
+    bleedout_max_touch_ratio: float = 0.7
+    bleedout_debug: bool = False
     truncate_z: Optional[float] = None
     degrade_img: Optional[bool] = False
 
@@ -458,32 +459,75 @@ def segment_mask_unaligned(
 
 
 def filter_plate_bleedout(
-    labeled: np.ndarray,
-    removal_mask: np.ndarray,
-    border_fraction: float = 0.5,
-) -> np.ndarray:
+    labeled: npt.NDArray,
+    removal_mask: npt.NDArray,
+    max_touch_ratio: float = 0.7,
+    connectivity: int = 1,
+    return_debug: bool = False,
+):
     """
-    Remove labeled objects where too many border pixels are adjacent to the removal mask.
+    Remove labeled objects whose free-perimeter ratio exceeds max_touch_ratio.
+    ---------------------------------------------------------------------------------------------------------------
+    The ratio is touching/free because a bleed-out
+    spills flat along the plate edge: its free boundary roughly parallels its
+    contact boundary, so the ratio approaches 1.  A compact off-plate chunk has
+    a free boundary that balloons past its contact (~2/pi for a hemisphere), so
+    its ratio stays well below 1.  A floater that never touches the plate at all
+    is trivially kept. touching/free correctly captures the geometric
+    relationship between contact and exposure.
+
+    The plate-adjacent region is computed with a one-pixel dilation of
+    removal_mask.  This is a rasterisation tolerance — it captures spill-outs
+    sitting one pixel off the geometric rectangle boundary — not an adjacency
+    radius; the dilation is intentionally kept to exactly one pixel.
     ---------------------------------------------------------------------------------------------------------------
     INPUTS:
-        labeled: np.ndarray, labeled image of unaligned chromosomes (background = 0)
-        removal_mask: np.ndarray, boolean mask of the metaphase plate removal region
-        border_fraction: float, fraction of the object's total pixels whose border touches
-                         the removal mask, above which an object is considered a bleed-out (default=0.5)
+        labeled: npt.NDArray, labeled image of unaligned chromosomes (background = 0)
+        removal_mask: npt.NDArray, boolean mask of the metaphase plate removal region
+        max_touch_ratio: float, maximum allowed touching/free perimeter ratio before an
+                         object is classified as a bleed-out and removed (default=0.7)
+        connectivity: int, pixel adjacency used to define "touching the plate":
+                      2 = 8-connectivity (3x3 square structuring element),
+                      1 = 4-connectivity (plus-shaped diamond(1) element) (default=2)
+        return_debug: bool, if True return (filtered, debug_dict) instead of just filtered
+                      (default=False)
     OUTPUTS:
-        filtered: np.ndarray, labeled image with bleed-out objects removed (set to 0)
+        filtered: npt.NDArray, labeled image with bleed-out objects removed (pixels set to 0)
+        debug: dict (only when return_debug=True), maps each label to
+               {"n_touch": int, "n_free": int, "ratio": float, "removed": bool};
+               floaters get ratio=0.0/removed=False, pure-rind objects get ratio=inf/removed=True
     """
-    dilated_removal = binary_dilation(removal_mask, disk(1))
     filtered = labeled.copy()
+    debug = {}
+
+    if removal_mask.sum() == 0:
+        return (filtered, debug) if return_debug else filtered
+
+    selem = square(3) if connectivity == 2 else diamond(1)
+    plate_adjacent = binary_dilation(removal_mask, selem)
 
     for lbl in np.unique(labeled[labeled > 0]):
         obj_mask = labeled == lbl
         perimeter = find_boundaries(obj_mask, mode='inner')
-        touching = np.sum(perimeter & dilated_removal)
-        if (touching / np.sum(obj_mask)) > border_fraction:
-            filtered[obj_mask] = 0
+        n_touch = int(np.sum(perimeter & plate_adjacent))
+        n_free = int(np.sum(perimeter & ~plate_adjacent))
 
-    return filtered
+        if n_touch == 0:
+            debug[lbl] = {"n_touch": n_touch, "n_free": n_free, "ratio": 0.0, "removed": False}
+            continue
+
+        if n_free == 0:
+            filtered[obj_mask] = 0
+            debug[lbl] = {"n_touch": n_touch, "n_free": n_free, "ratio": float("inf"), "removed": True}
+            continue
+
+        ratio = n_touch / n_free
+        removed = ratio >= max_touch_ratio
+        if removed:
+            filtered[obj_mask] = 0
+        debug[lbl] = {"n_touch": n_touch, "n_free": n_free, "ratio": ratio, "removed": removed}
+
+    return (filtered, debug) if return_debug else filtered
 
 
 def segment_unaligned_chromosomes(
@@ -516,7 +560,16 @@ def segment_unaligned_chromosomes(
     labeled, total_chromatin_mask = segment_mask_unaligned(
         removal_mask, tophat_cell, cell_mask
     )
-    labeled = filter_plate_bleedout(labeled, removal_mask, config.border_fraction)
+    bleedout_result = filter_plate_bleedout(
+        labeled, removal_mask,
+        max_touch_ratio=config.bleedout_max_touch_ratio,
+        return_debug=config.bleedout_debug,
+    )
+    if config.bleedout_debug:
+        labeled, bleedout_debug = bleedout_result
+    else:
+        labeled = bleedout_result
+        bleedout_debug = {}
 
     # Compute total chromatin measurements from the mask
     total_chromatin_area = np.nansum(total_chromatin_mask)
@@ -527,7 +580,7 @@ def segment_unaligned_chromosomes(
 
     if labels.size == 0:
         measurements = (0, 0, 0, total_chromatin_area, total_chromatin_intensity)
-        return measurements, labeled
+        return measurements, labeled, bleedout_debug
 
     areas, intensities = [], []
     for lbl in labels:
@@ -546,7 +599,7 @@ def segment_unaligned_chromosomes(
         total_chromatin_intensity,
     )
 
-    return measurements, labeled
+    return measurements, labeled, bleedout_debug
 
 
 
@@ -632,7 +685,7 @@ def unaligned_chromatin(
                 u_num,
                 t_area,
                 t_area_int,
-            ), labeled_chromosomes = segment_unaligned_chromosomes(
+            ), labeled_chromosomes, _ = segment_unaligned_chromosomes(
                 cell, tophat_cell, removal_mask, cell_mask, config
             )
 

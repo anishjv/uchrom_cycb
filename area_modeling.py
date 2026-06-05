@@ -408,18 +408,19 @@ def run_pipeline(
     mask = psuedo_cellapp_mask(tophat_cell, config)
     metphs_plt, width = determine_removal_mask(tophat_cell, cell, mask, config)
 
-    measurements, uchroms = segment_unaligned_chromosomes(
+    measurements, uchroms, bleedout_debug = segment_unaligned_chromosomes(
         cell, tophat_cell, metphs_plt, mask, config
     )
 
-    chrom_num, fast_uchroms, chrom_area = read_chrom_num(seg_3d, mask, metphs_plt, config=config) 
+    chrom_num, fast_uchroms, chrom_area = read_chrom_num(seg_3d, mask, metphs_plt, config=config)
 
     for_vals = [
         measurements[0],
         chrom_num,
         chrom_area,
-        width
-        ]
+        width,
+        bleedout_debug,
+    ]
 
     for_ims = [
         cell,
