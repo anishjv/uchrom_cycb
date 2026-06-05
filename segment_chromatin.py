@@ -39,7 +39,7 @@ class ChromatinSegConfig:
     min_chromatin_area: int = 20
     eccentricity_threshold: float = 0.7 #largest region must have eccentricty greater than threshold to be considered for metaphase plate detection
     euler_threshold: float = -2 # can be no more than three holes in the metaphase plate
-    border_fraction: float = 0.5
+    border_fraction: float = 0.3
     truncate_z: Optional[float] = None
     degrade_img: Optional[bool] = False
 
