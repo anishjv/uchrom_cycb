@@ -10,7 +10,7 @@ from scipy.signal import find_peaks
 from typing import Optional
 import glob
 import re
-from segment_chromatin import unaligned_chromatin, ChromatinSegConfig
+from uchrom_cycb.segment_chromatin import unaligned_chromatin, ChromatinSegConfig
 import sys
 import h5py
 
