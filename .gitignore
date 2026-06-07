@@ -1,4 +1,6 @@
 CLAUDE.md
+docs/
+.claude/
 .DS_Store
 __pycache__/
 *.pyc

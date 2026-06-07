@@ -7,7 +7,7 @@ from typing import Optional, Tuple
 
 import skimage
 from skimage.exposure import rescale_intensity
-from skimage.morphology import disk, square, diamond, remove_small_objects, binary_erosion, binary_dilation
+from skimage.morphology import disk, footprint_rectangle, diamond, remove_small_objects, binary_erosion, binary_dilation
 from skimage.filters import threshold_otsu, gaussian, threshold_li
 from skimage.measure import label, regionprops
 from skimage.segmentation import clear_border, find_boundaries
@@ -39,7 +39,7 @@ class ChromatinSegConfig:
     min_chromatin_area: int = 20
     eccentricity_threshold: float = 0.7 #largest region must have eccentricty greater than threshold to be considered for metaphase plate detection
     euler_threshold: float = -2 # can be no more than three holes in the metaphase plate
-    bleedout_max_touch_ratio: float = 0.7
+    bleedout_max_touch_ratio: float = 1.0
     bleedout_debug: bool = False
     bleedout_connec: int = 2
     truncate_z: Optional[float] = None
@@ -504,7 +504,7 @@ def filter_plate_bleedout(
     if removal_mask.sum() == 0:
         return (filtered, debug) if return_debug else filtered
 
-    selem = square(3) if connectivity == 2 else diamond(1)
+    selem = footprint_rectangle((3,3)) if connectivity == 2 else diamond(1)
     plate_adjacent = binary_dilation(removal_mask, selem)
 
     for lbl in np.unique(labeled[labeled > 0]):

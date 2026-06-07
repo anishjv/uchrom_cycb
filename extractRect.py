@@ -4,7 +4,6 @@ from builtins import range
 from past.utils import old_div
 import numpy as np
 from scipy import ndimage, optimize
-import pdb 
 import matplotlib.pyplot as plt
 import cv2
 import matplotlib.patches as patches
