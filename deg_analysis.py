@@ -10,6 +10,7 @@ sys.path.append('/Users/whoisv/')
 from uchrom_cycb.changept import deriv_changept
 from skimage.restoration import denoise_tv_chambolle
 from skimage.segmentation import find_boundaries
+from scipy.ndimage import median_filter
 from scipy.signal import peak_widths, find_peaks
 
 import warnings
@@ -781,9 +782,66 @@ def synth_rate_statistics(group, df_agg_qc, min_seg=3):
     )
 
 
+def adaptive_bilateral_1d(x, sigma_min=1.0, sigma_range_min=3.0, min_int=10, gain=1.0, read_noise_var=4.0):
+    """
+    Smooths a 1D array using a bilateral filter whose spatial and range sigmas
+    both scale with local shot noise variance. The range sigma prevents cross-edge
+    averaging at sharp transitions while remaining permissive enough at high
+    intensities where true shot noise is large.
+    -----------------------------------------------------------------------------
+    INPUTS:
+        x              : npt.NDArray, 1D fluorescence intensity array
+        sigma_min      : float, minimum spatial sigma (at min_int). Default 1.0.
+        sigma_range_min: float, range sigma at min_int — sets edge sensitivity at
+                         the slow→fast transition. Default 3.0.
+        min_int        : float, intensity defining the transition zone. Default 10.
+        gain           : float, camera counts per photoelectron. Default 1.0.
+        read_noise_var : float, readout noise variance. Default 4.0.
+    OUTPUTS:
+        smoothed : npt.NDArray, smoothed trace, same shape as x.
+    """
+    x = np.asarray(x)
+    n = len(x)
+    if n <= 1:
+        return x.copy()
+
+    pilot         = median_filter(x, size=min(3, n))
+    pilot_clipped = np.maximum(0, pilot)
+
+    var_pilot = (gain * pilot_clipped) + read_noise_var
+    var_min   = (gain * min_int) + read_noise_var
+
+    noise_ratio = var_pilot / var_min
+
+    sigmas       = np.maximum(sigma_min,       sigma_min       * noise_ratio)
+    sigmas       = np.minimum(int(n / 24), sigmas)
+    sigma_ranges = np.maximum(sigma_range_min, sigma_range_min * noise_ratio)
+
+    smoothed = np.zeros_like(x, dtype=float)
+
+    for i in range(n):
+        sigma       = sigmas[i]
+        sigma_range = sigma_ranges[i]
+        radius      = int(np.ceil(4 * sigma))
+        start       = max(0, i - radius)
+        end         = min(n, i + radius + 1)
+
+        t          = np.arange(start, end) - i
+        spatial_w  = np.exp(-t**2 / (2 * sigma**2))
+        range_w    = np.exp(-(x[start:end] - x[i])**2 / (2 * sigma_range**2))
+        weights    = spatial_w * range_w
+
+        weights_sum = np.sum(weights)
+        weights     = weights / weights_sum if weights_sum > 0 else np.ones_like(weights) / len(weights)
+
+        smoothed[i] = np.sum(x[start:end] * weights)
+
+    return smoothed
+
+
 def add_addl_metrics(
-    df_agg: pd.DataFrame, df_agg_qc: pd.DataFrame, noc:Optional[bool]=False, type:Optional[str]="none"
-    ) ->tuple[pd.DataFrame]:
+    df_agg: pd.DataFrame, df_agg_qc: pd.DataFrame, noc: Optional[bool] = False
+) -> tuple[pd.DataFrame]:
 
     """
     Function to add extra metrics to chromatin.xlsx dataframes
@@ -794,18 +852,13 @@ def add_addl_metrics(
     """
 
     cp_remediate = False if not noc else True
-    match type:
-        case "rpe":
-            weight = 10
-        case "oe":
-            weight = 100
-        case "none":
-            weight = 5
 
     df_agg["cycb_smoothed"] = (
         df_agg
         .groupby(["cell_id", "date", "well"], sort=False)["cycb_intensity"]
-        .transform(lambda x: denoise_tv_chambolle(x, weight = weight))
+        .transform(lambda x: adaptive_bilateral_1d(
+            x, sigma_min=1.0, sigma_range_min=3.0, min_int=10, gain=1.0, read_noise_var=4.0
+        ))
     )
 
     df_agg["cycb_deg_rate"] = (
