@@ -205,6 +205,14 @@ def aggregate_clean_dfs(
             .reset_index(level=0, drop=True)
         )
 
+        # Smooth before QC criteria so validate_cyclin_b_trace operates on smoothed trace
+        df["cycb_smoothed"] = (
+            df.groupby("cell_id", sort=False)["cycb_intensity"]
+            .transform(lambda x: adaptive_bilateral_1d(
+                x, sigma_min=1.0, sigma_range_min=3.0, min_int=10, gain=1.0, read_noise_var=4.0
+            ))
+        )
+
         # Feature Calculations
         criteria = (
             df.sort_values(["cell_id", "frame"])
@@ -212,7 +220,7 @@ def aggregate_clean_dfs(
             .apply(
                 lambda g: pd.Series(
                     validate_cyclin_b_trace(
-                        trace=g["cycb_intensity"].values,
+                        trace=g["cycb_smoothed"].values,
                         semantic=g["semantic_contig"].values,
                     ),
                     index=[
@@ -349,7 +357,7 @@ def cp_statistics(
     else:
         peak_row = active_phase.iloc[int(peak_idx)]
         peak_frame = peak_row["frame"]
-        peak_intensity = peak_row["cycb_intensity"]
+        peak_intensity = peak_row["cycb_smoothed"]
         peak_value = deriv[int(peak_idx)]
 
     if pd.isna(ap_idx):
@@ -358,7 +366,7 @@ def cp_statistics(
     else:
         ap_row = active_phase.iloc[int(ap_idx)]
         ap_frame = ap_row["frame"]
-        ap_intensity = ap_row["cycb_intensity"]
+        ap_intensity = ap_row["cycb_smoothed"]
 
     if pd.isna(cp_idx):
         cp_frame = np.nan
@@ -366,7 +374,7 @@ def cp_statistics(
     else:
         cp_row = active_phase.iloc[int(cp_idx)]
         cp_frame = cp_row["frame"]
-        cp_intensity = cp_row["cycb_intensity"]
+        cp_intensity = cp_row["cycb_smoothed"]
 
     return pd.Series(
         [
@@ -493,11 +501,11 @@ def max_cycb_statistics(group: pd.DataFrame) -> pd.Series:
 
     # Find the row with the maximum intensity
     # .idxmax() returns the index of the first occurrence of the maximum
-    max_idx = mitotic_region["cycb_intensity"].idxmax()
+    max_idx = mitotic_region["cycb_smoothed"].idxmax()
     max_row = mitotic_region.loc[max_idx]
 
     return pd.Series(
-        [max_row["frame"], max_row["cycb_intensity"]], 
+        [max_row["frame"], max_row["cycb_smoothed"]],
         index=["max_cycb_frame", "max_cycb_intensity"]
     )
 
@@ -853,13 +861,14 @@ def add_addl_metrics(
 
     cp_remediate = False if not noc else True
 
-    df_agg["cycb_smoothed"] = (
-        df_agg
-        .groupby(["cell_id", "date", "well"], sort=False)["cycb_intensity"]
-        .transform(lambda x: adaptive_bilateral_1d(
-            x, sigma_min=1.0, sigma_range_min=3.0, min_int=10, gain=1.0, read_noise_var=4.0
-        ))
-    )
+    if "cycb_smoothed" not in df_agg.columns:
+        df_agg["cycb_smoothed"] = (
+            df_agg
+            .groupby(["cell_id", "date", "well"], sort=False)["cycb_intensity"]
+            .transform(lambda x: adaptive_bilateral_1d(
+                x, sigma_min=1.0, sigma_range_min=3.0, min_int=10, gain=1.0, read_noise_var=4.0
+            ))
+        )
 
     df_agg["cycb_deg_rate"] = (
         df_agg
