@@ -878,6 +878,39 @@ def adaptive_bilateral_1d(x, sigma_min=1.0, sigma_range_min=3.0, min_int=10, gai
     return smoothed
 
 
+def floor_cycb_statistics(group: pd.DataFrame, anaphase_end_frame, window: int = 30) -> pd.Series:
+    """
+    Find the Cyclin B floor after anaphase end
+    -------------------------------------------
+    INPUTS:
+        group: pd.DataFrame, per-cell rows containing 'frame' and 'cycb_smoothed'
+        anaphase_end_frame: int or float, frame marking the end of the anaphase area drop
+        window: int, number of frames after anaphase_end_frame to search for the minimum
+    OUTPUTS:
+        pd.Series containing:
+            floor_cycb_frame: int, frame of minimum cyclin B in the search window
+            floor_cycb_intensity: float, smoothed cyclin B value at that frame
+    """
+    index = ["floor_cycb_frame", "floor_cycb_intensity"]
+    nan_series = pd.Series([np.nan, np.nan], index=index)
+
+    if pd.isna(anaphase_end_frame):
+        return nan_series
+
+    group = group.sort_values("frame")
+    mask = (group["frame"] >= anaphase_end_frame) & (group["frame"] <= anaphase_end_frame + window)
+    window_df = group[mask]
+
+    if window_df.empty:
+        return nan_series
+
+    min_idx = window_df["cycb_smoothed"].idxmin()
+    return pd.Series(
+        [window_df.loc[min_idx, "frame"], window_df.loc[min_idx, "cycb_smoothed"]],
+        index=index,
+    )
+
+
 def add_addl_metrics(
     df_agg: pd.DataFrame, df_agg_qc: pd.DataFrame, noc: Optional[bool] = False
 ) -> tuple[pd.DataFrame]:
@@ -954,6 +987,23 @@ def add_addl_metrics(
         .reset_index()
     )
     df_agg_qc = df_agg_qc.merge(jump_info, on=["date", "well", "cell_id"], how="left")
+
+    # 5. Get Cyclin B floor after anaphase
+    qc_indexed = df_agg_qc.set_index(["date", "well", "cell_id"])
+    floor_info = (
+        df_agg.groupby(["date", "well", "cell_id"])
+        .apply(
+            lambda g: floor_cycb_statistics(
+                g,
+                qc_indexed.loc[
+                    (g.name[0], g.name[1], g.name[2]), "anaphase_end_frame"
+                ] if g.name in qc_indexed.index else np.nan,
+            ),
+            include_groups=False,
+        )
+        .reset_index()
+    )
+    df_agg_qc = df_agg_qc.merge(floor_info, on=["date", "well", "cell_id"], how="left")
 
     synth_info = (
         df_agg.groupby(["date", "well", "cell_id"])
