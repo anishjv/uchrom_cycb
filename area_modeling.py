@@ -101,7 +101,7 @@ def degrade_to_ixn(
     '''
     Degrades Z-stacks taken on the Joglekar Lab's confocal microscope
     to appear as if they were taken with a 0.45 NA, 20X objective.
-
+    --------------------------------------------------------------
     INPUTS:
         hq_stack: 3D Z-stack (Z,Y,X)
         current_ps: XY pixel size in microns of input stack

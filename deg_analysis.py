@@ -390,6 +390,27 @@ def cp_statistics(
     )
 
 
+def _find_dominant_drop(
+    signal: np.ndarray,
+    min_height: float = 1.0,
+) -> Optional[tuple[int, float]]:
+    """
+    In a windowed -area_derivative signal, find the tallest peak.
+    --------------------------------------------------------------
+    INPUTS:
+        signal: np.ndarray, windowed inverted area derivative (-area_derivative)
+        min_height: float, minimum peak height to qualify
+    OUTPUTS:
+        Optional[tuple[int, float]]:
+            (peak_idx, peak_height) local to signal; None if no qualifying peak found
+    """
+    peaks, props = find_peaks(signal, height=min_height)
+    if len(peaks) == 0:
+        return None
+    best = int(np.argmax(props["peak_heights"]))
+    return int(peaks[best]), float(props["peak_heights"][best])
+
+
 def area_jump_statistics(
     group: pd.DataFrame,
     min_height: float = 1,
@@ -398,30 +419,43 @@ def area_jump_statistics(
     """
     Wrapper to handle pandas groups and return frames corresponding to area collapse dynamics
     -------------------------------------------------------------------------------------------
-    For each cell, defines a search window spanning from 2× mitotic duration before mitotic onset
-    to the midpoint of mitosis, then identifies the largest negative excursion in area derivative
-    (i.e., the steepest drop in area). The dominant peak is selected based on absolute height
-    (not prominence), and the onset of the collapse is defined as the point where
-    the signal reaches 75% of peak height on the left flank.
+    Identifies two distinct area drop events in -area_derivative:
+
+    1. Rounding-up peak: steepest area drop as the cell rounds up entering mitosis.
+       Searched from 25 frames before mitotic onset to the CycB peak.
+
+    2. Division peak: sharp area drop at anaphase as tracking switches from mother to
+       daughter cell. Searched from max(CycB peak, end_mito - 10) to
+       min(trace end, end_mito + 10).
+
+    Both peaks use identical base logic: left and right bases are the 75% height
+    crossings from peak_widths(rel_height=0.75).
 
     -------------------------------------------------------------------------------------------
     INPUTS:
         group: pd.DataFrame, grouped (by cell) dataframe containing:
             - 'frame': int, time index
             - 'semantic_contig': int/bool, contiguous mitotic annotation (1 = mitosis)
+            - 'cycb_smoothed': float, smoothed Cyclin B signal
             - 'area_derivative': float, time derivative of cell area
         min_height: float, minimum peak height in -area_derivative required to consider
                     a candidate area collapse event
 
     OUTPUTS:
         pd.Series containing:
-            t_areajump: int, frame corresponding to left 75% height crossing of dominant peak
-                        (interpreted as onset of area collapse)
-            jump_height: float, height of the detected peak in -area_derivative
-                         (proxy for magnitude of area collapse)
+            roundup_start_frame: int, left 75% height crossing of the rounding-up peak
+            roundup_end_frame: int, right 75% height crossing of the rounding-up peak
+            roundup_peak_frame: int, frame of the rounding-up peak
+            anaphase_start_frame: int, left 75% height crossing of the division peak
+            anaphase_end_frame: int, right 75% height crossing of the division peak
+            anaphase_peak_frame: int, frame of the division peak
     """
 
-    index = ["t_areajump", "jump_height"]
+    index = [
+        "roundup_start_frame", "roundup_end_frame", "roundup_peak_frame",
+        "anaphase_start_frame", "anaphase_end_frame", "anaphase_peak_frame",
+    ]
+    nan_series = pd.Series([np.nan] * 6, index=index)
 
     group = group.sort_values("frame").reset_index(drop=True)
 
@@ -430,52 +464,49 @@ def area_jump_statistics(
     area_deriv = group["area_derivative"].to_numpy()
     frames = group["frame"].to_numpy()
 
-    # --- identify mitotic region ---
     mito_idx = np.where(sem == 1)[0]
     if len(mito_idx) == 0:
-        return pd.Series([np.nan, np.nan], index=index)
+        return nan_series
 
     start_mito = mito_idx[0]
+    end_mito = mito_idx[-1]
+    cycb_peak_idx = int(np.argmax(cycb))
 
-    # --- define search window ---
-    start_idx = max(0, start_mito - 25)
-    end_idx = np.argmax(cycb)
+    # ── rounding-up peak ────────────────────────────────────────────────────
+    roundup_start = roundup_end = roundup_peak = np.nan
 
-    if end_idx <= start_idx:
-        return pd.Series([np.nan, np.nan], index=index)
+    round_start = max(0, start_mito - 25)
+    round_end = cycb_peak_idx
 
-    # invert to detect drops as peaks
-    window_signal = -area_deriv[start_idx:end_idx]
+    if round_end > round_start:
+        window = -area_deriv[round_start:round_end]
+        result = _find_dominant_drop(window, min_height)
+        if result is not None:
+            peak_idx, _ = result
+            _, _, left_ips, right_ips = peak_widths(window, [peak_idx], rel_height=0.75)
+            roundup_start = frames[round_start + int(np.floor(left_ips[0]))]
+            roundup_peak = frames[round_start + peak_idx]
+            roundup_end = frames[round_start + int(np.ceil(right_ips[0]))]
 
-    # --- peak detection (height-based) ---
-    peaks, props = find_peaks(window_signal, height=min_height)
+    # ── division peak (anaphase) ─────────────────────────────────────────────
+    anaphase_start = anaphase_end = anaphase_peak = np.nan
 
-    if len(peaks) == 0:
-        return pd.Series([np.nan, np.nan], index=index)
+    ana_start = max(cycb_peak_idx, end_mito - 10)
+    ana_end = min(len(frames) - 1, end_mito + 10)
 
-    heights = props["peak_heights"]
-
-    # --- select tallest peak ---
-    best = np.argmax(heights)
-    peak_idx = peaks[best]
-
-    # --- compute 75% height crossings ---
-    widths, width_heights, left_ips, right_ips = peak_widths(
-        window_signal,
-        [peak_idx],
-        rel_height=0.75
-    )
-
-    left_ip = left_ips[0]
-
-    # --- map back to global indices ---
-    global_left = int(np.floor(start_idx + left_ip))
+    if ana_end > ana_start:
+        window = -area_deriv[ana_start : ana_end + 1]
+        result = _find_dominant_drop(window, min_height)
+        if result is not None:
+            peak_idx, _ = result
+            _, _, left_ips, right_ips = peak_widths(window, [peak_idx], rel_height=0.75)
+            anaphase_start = frames[ana_start + int(np.floor(left_ips[0]))]
+            anaphase_peak = frames[ana_start + peak_idx]
+            anaphase_end = frames[ana_start + int(np.ceil(right_ips[0]))]
 
     return pd.Series(
-        [
-            frames[global_left],
-            heights[best],
-        ],
+        [roundup_start, roundup_end, roundup_peak,
+         anaphase_start, anaphase_end, anaphase_peak],
         index=index
     )
 
@@ -629,7 +660,7 @@ def synth_rate_statistics(group, df_agg_qc, min_seg=3):
 
     Strategy:
     1. Detect likely NEB timing from the largest positive jump in
-       Cyclin B intensity near t_areajump.
+       Cyclin B intensity near roundup_start_frame.
 
     2. Define matched windows:
            back  = pre-NEB
@@ -646,7 +677,7 @@ def synth_rate_statistics(group, df_agg_qc, min_seg=3):
             - cycb_deg_rate
 
         df_agg_qc:
-            - t_areajump
+            - roundup_start_frame
             - max_cycb_frame
 
     RETURNS:
@@ -687,10 +718,10 @@ def synth_rate_statistics(group, df_agg_qc, min_seg=3):
 
     qc = df_agg_qc.set_index(key_cols).loc[key]
 
-    t_areajump = qc["t_areajump"]
+    t_roundup_start = qc["roundup_start_frame"]
     t_max = qc["max_cycb_frame"]
 
-    if np.isnan(t_areajump) or np.isnan(t_max):
+    if np.isnan(t_roundup_start) or np.isnan(t_max):
         return nan_return
 
     frames = group["frame"].to_numpy()
@@ -698,8 +729,8 @@ def synth_rate_statistics(group, df_agg_qc, min_seg=3):
 
     # Detect NEB-associated influx jump
     search_mask = (
-        (frames >= t_areajump - 10) &
-        (frames <= t_areajump + 10)
+        (frames >= t_roundup_start - 10) &
+        (frames <= t_roundup_start + 10)
     )
 
     if np.sum(search_mask) < min_seg:
@@ -822,7 +853,7 @@ def adaptive_bilateral_1d(x, sigma_min=1.0, sigma_range_min=3.0, min_int=10, gai
     noise_ratio = var_pilot / var_min
 
     sigmas       = np.maximum(sigma_min,       sigma_min       * noise_ratio)
-    sigmas       = np.minimum(int(n / 24), sigmas)
+    sigmas       = np.minimum(max(sigma_min, n / 24), sigmas)
     sigma_ranges = np.maximum(sigma_range_min, sigma_range_min * noise_ratio)
 
     smoothed = np.zeros_like(x, dtype=float)
@@ -879,7 +910,9 @@ def add_addl_metrics(
     df_agg["area_smoothed"] = (
         df_agg
         .groupby(["cell_id", "date", "well"], sort=False)["cell_area"]
-        .transform(lambda x: denoise_tv_chambolle(x*0.3387**2, weight = 50))
+        .transform(lambda x: adaptive_bilateral_1d(
+                x*0.3387**2, sigma_min=1.0, sigma_range_min=3.0, min_int=10, gain=1.0, read_noise_var=4.0
+            ))
     )
 
     df_agg["area_derivative"] = (
@@ -1027,16 +1060,16 @@ def render_chromatin_composite(
     # Unaligned chromosomes overlay
     if labeled_chromosomes is not None:
         colors = [
-            [1, 0, 0, 0.2],
-            [0, 1, 0, 0.2],
-            [0, 0, 1, 0.2],
-            [1, 1, 0, 0.2],
-            [1, 0, 1, 0.2],
-            [0, 1, 1, 0.2],
-            [1, 0.5, 0, 0.2],
-            [0.5, 0, 1, 0.2],
-            [0, 0.5, 0, 0.2],
-            [0.5, 0.5, 0, 0.2],
+            [0.357, 0.498, 0.749, 0.6],  # #5B7FBF — steel blue
+            [0.302, 0.659, 0.627, 0.6],  # #4DA8A0 — teal
+            [0.337, 0.706, 0.263, 0.6],  # #56B443 — mid green  ← your existing green
+            [0.482, 0.408, 0.784, 0.6],  # #7B68C8 — periwinkle
+            [0.690, 0.376, 0.565, 0.6],  # #B06090 — mauve
+            [0.290, 0.565, 0.769, 0.6],  # #4A90C4 — sky blue
+            [0.427, 0.722, 0.478, 0.6],  # #6DB87A — sage green
+            [0.608, 0.447, 0.722, 0.6],  # #9B72B8 — soft violet
+            [0.353, 0.659, 0.753, 0.6],  # #5AA8C0 — cerulean
+            [0.769, 0.478, 0.667, 0.6],  # #C47AAA — dusty pink
         ]
         unique_labels = np.unique(labeled_chromosomes[labeled_chromosomes > 0])
         for i, lbl in enumerate(unique_labels):
@@ -1061,6 +1094,7 @@ def visualize_chromatin_hd5(
     chunk_size: int = 12,
     center: Optional[int] = None,
     display_data: Optional[list[list]] = None,
+    overlays: bool = True,
 ):
     """
     Visualize chromatin time-series from an HDF5 cell stack, organized in chunks.
@@ -1099,6 +1133,12 @@ def visualize_chromatin_hd5(
             number. Each list must have the same length as `frames`. Float values
             are rounded to the nearest integer. The x-axis label for each timepoint
             will read: frame, val1, val2, ...
+
+        overlays : bool, default=True
+            If True, renders the full composite (cell boundary, chromosome labels,
+            metaphase plate) via render_chromatin_composite. If False, displays
+            only the raw grayscale 'cell' array — faster because it skips reading
+            cell_mask, labeled, and removal_mask from HDF5 and skips all blending.
 
     -------------------------------------------------------------------------------------------
     OUTPUTS:
@@ -1147,18 +1187,21 @@ def visualize_chromatin_hd5(
             chunk_groups = cell_groups[start:end]
             n_cols = len(chunk_groups)
 
-            fig, axes = plt.subplots(1, n_cols, figsize=(3 * n_cols, 3), squeeze=False)
+            fig, axes = plt.subplots(1, n_cols, figsize=(3 * n_cols, 3), squeeze=False, dpi=48)
 
             for col, name in enumerate(chunk_groups):
                 grp = f[name]
-                cell      = grp["cell"][()].astype(np.float32)
-                cell_mask = grp["cell_mask"][()].astype(bool)
-                labeled   = grp["labeled"][()].astype(np.int16)   if "labeled"      in grp else None
-                removal   = grp["removal_mask"][()].astype(bool)  if "removal_mask" in grp else None
-                composite = render_chromatin_composite(cell, cell_mask, labeled, removal)
+                if overlays:
+                    cell      = grp["cell"][()].astype(np.float32)
+                    cell_mask = grp["cell_mask"][()].astype(bool)
+                    labeled   = grp["labeled"][()].astype(np.int16)  if "labeled"      in grp else None
+                    removal   = grp["removal_mask"][()].astype(bool) if "removal_mask" in grp else None
+                    img = render_chromatin_composite(cell, cell_mask, labeled, removal)
+                else:
+                    img = grp["cell"][()].astype(np.float32)
 
                 ax = axes[0, col]
-                ax.imshow(composite)
+                ax.imshow(img, cmap="gray" if not overlays else None)
                 ax.tick_params(left=False, bottom=False, labelleft=False)
                 for spine in ax.spines.values():
                     spine.set_visible(False)
@@ -1171,7 +1214,7 @@ def visualize_chromatin_hd5(
                 ax.xaxis.set_label_position("bottom")
 
             plt.tight_layout()
-            plt.show()
+            #plt.show()
             figs.append(fig)
 
         return figs
