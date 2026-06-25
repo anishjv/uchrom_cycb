@@ -286,8 +286,8 @@ def cp_statistics(
     index = [
         "cp_frame",
         "cp_intensity",
-        "ap_frame",
-        "ap_intensity",
+        "fast_phs_end_frame",
+        "fast_phs_end_intensity",
         "fast_phs_frame",
         "fast_phs_intensity",
         "fast_phs_deg_rate",
@@ -361,12 +361,12 @@ def cp_statistics(
         peak_value = deriv[int(peak_idx)]
 
     if pd.isna(ap_idx):
-        ap_frame = np.nan
-        ap_intensity = np.nan
+        fast_phs_end_frame = np.nan
+        fast_phs_end_intensity = np.nan
     else:
         ap_row = active_phase.iloc[int(ap_idx)]
-        ap_frame = ap_row["frame"]
-        ap_intensity = ap_row["cycb_smoothed"]
+        fast_phs_end_frame = ap_row["frame"]
+        fast_phs_end_intensity = ap_row["cycb_smoothed"]
 
     if pd.isna(cp_idx):
         cp_frame = np.nan
@@ -380,8 +380,8 @@ def cp_statistics(
         [
             cp_frame,
             cp_intensity,
-            ap_frame,
-            ap_intensity,
+            fast_phs_end_frame,
+            fast_phs_end_intensity,
             peak_frame,
             peak_intensity,
             peak_value,
@@ -445,15 +445,15 @@ def area_jump_statistics(
         pd.Series containing:
             roundup_start_frame: int, left 75% height crossing of the rounding-up peak
             roundup_end_frame: int, right 75% height crossing of the rounding-up peak
-            roundup_peak_frame: int, frame of the rounding-up peak
+            roundup_frame: int, frame of the rounding-up peak
             anaphase_start_frame: int, left 75% height crossing of the division peak
             anaphase_end_frame: int, right 75% height crossing of the division peak
-            anaphase_peak_frame: int, frame of the division peak
+            anaphase_frame: int, frame of the division peak
     """
 
     index = [
-        "roundup_start_frame", "roundup_end_frame", "roundup_peak_frame",
-        "anaphase_start_frame", "anaphase_end_frame", "anaphase_peak_frame",
+        "roundup_start_frame", "roundup_end_frame", "roundup_frame",
+        "anaphase_start_frame", "anaphase_end_frame", "anaphase_frame",
     ]
     nan_series = pd.Series([np.nan] * 6, index=index)
 
@@ -473,7 +473,7 @@ def area_jump_statistics(
     cycb_peak_idx = int(np.argmax(cycb))
 
     # ── rounding-up peak ────────────────────────────────────────────────────
-    roundup_start = roundup_end = roundup_peak = np.nan
+    roundup_start = roundup_end = roundup_frame = np.nan
 
     round_start = max(0, start_mito - 25)
     round_end = cycb_peak_idx
@@ -485,11 +485,11 @@ def area_jump_statistics(
             peak_idx, _ = result
             _, _, left_ips, right_ips = peak_widths(window, [peak_idx], rel_height=0.75)
             roundup_start = frames[round_start + int(np.floor(left_ips[0]))]
-            roundup_peak = frames[round_start + peak_idx]
+            roundup_frame = frames[round_start + peak_idx]
             roundup_end = frames[round_start + int(np.ceil(right_ips[0]))]
 
     # ── division peak (anaphase) ─────────────────────────────────────────────
-    anaphase_start = anaphase_end = anaphase_peak = np.nan
+    anaphase_start = anaphase_end = anaphase_frame = np.nan
 
     ana_start = max(cycb_peak_idx, end_mito - 10)
     ana_end = min(len(frames) - 1, end_mito + 10)
@@ -501,12 +501,12 @@ def area_jump_statistics(
             peak_idx, _ = result
             _, _, left_ips, right_ips = peak_widths(window, [peak_idx], rel_height=0.75)
             anaphase_start = frames[ana_start + int(np.floor(left_ips[0]))]
-            anaphase_peak = frames[ana_start + peak_idx]
+            anaphase_frame = frames[ana_start + peak_idx]
             anaphase_end = frames[ana_start + int(np.ceil(right_ips[0]))]
 
     return pd.Series(
-        [roundup_start, roundup_end, roundup_peak,
-         anaphase_start, anaphase_end, anaphase_peak],
+        [roundup_start, roundup_end, roundup_frame,
+         anaphase_start, anaphase_end, anaphase_frame],
         index=index
     )
 
@@ -682,27 +682,27 @@ def synth_rate_statistics(group, df_agg_qc, min_seg=3):
 
     RETURNS:
         pd.Series containing:
-            t_nucbrk
+            roundup_frame_refined
             ksynth_back
             ksynth_front
-            std_back
-            std_front
-            back_start
-            back_end
-            front_start
-            front_end
+            ksynth_std_back
+            ksynth_std_front
+            ksynth_back_start
+            ksynth_back_end
+            ksynth_front_start
+            ksynth_front_end
     """
 
     return_index = [
-        "t_nucbrk",
+        "roundup_frame_refined",
         "ksynth_back",
         "ksynth_front",
-        "std_back",
-        "std_front",
-        "back_start",
-        "back_end",
-        "front_start",
-        "front_end"
+        "ksynth_std_back",
+        "ksynth_std_front",
+        "ksynth_back_start",
+        "ksynth_back_end",
+        "ksynth_front_start",
+        "ksynth_front_end"
     ]
 
     nan_return = pd.Series(
@@ -746,29 +746,29 @@ def synth_rate_statistics(group, df_agg_qc, min_seg=3):
 
     # largest positive jump = likely NEB-associated influx
     jump_idx = np.argmax(diffs)
-    t_nucbrk = search_frames[jump_idx + 1]
+    roundup_frame_refined = search_frames[jump_idx + 1]
 
     # Define post-NEB window
-    front_start = t_nucbrk + 2
+    ksynth_front_start = roundup_frame_refined + 2
 
     front_len = int(
-        (t_max - front_start) / 3
+        (t_max - ksynth_front_start) / 3
     )
 
-    front_end = front_start + front_len
+    ksynth_front_end = ksynth_front_start + front_len
 
     front_mask = (
-        (frames >= front_start) &
-        (frames <= front_end)
+        (frames >= ksynth_front_start) &
+        (frames <= ksynth_front_end)
     )
 
     # Define matched pre-NEB window
-    back_end = t_nucbrk - 4
-    back_start = back_end - front_len
+    ksynth_back_end = roundup_frame_refined - 4
+    ksynth_back_start = ksynth_back_end - front_len
 
     back_mask = (
-        (frames >= back_start) &
-        (frames <= back_end)
+        (frames >= ksynth_back_start) &
+        (frames <= ksynth_back_end)
     )
 
     # Ensure enough frames
@@ -802,20 +802,20 @@ def synth_rate_statistics(group, df_agg_qc, min_seg=3):
     ksynth_front = -1 * np.mean(rate_front)
     ksynth_back = -1 * np.mean(rate_back)
 
-    std_front = -1 * np.std(rate_front)
-    std_back = -1 * np.std(rate_back)
+    ksynth_std_front = -1 * np.std(rate_front)
+    ksynth_std_back = -1 * np.std(rate_back)
 
     return pd.Series(
         [
-            t_nucbrk,
+            roundup_frame_refined,
             ksynth_back,
             ksynth_front,
-            std_back,
-            std_front,
-            back_start,
-            back_end,
-            front_start,
-            front_end
+            ksynth_std_back,
+            ksynth_std_front,
+            ksynth_back_start,
+            ksynth_back_end,
+            ksynth_front_start,
+            ksynth_front_end
         ],
         index=return_index
     )
