@@ -20,7 +20,7 @@ def retrieve_traces(
     wl: str,
     frame_interval: int,
     remove_end_mitosis: Optional[bool] = False,
-) -> tuple[list[npt.NDArray], list[npt.NDArray], list, list, list[npt.NDArray], list]:
+) -> tuple[list[npt.NDArray], list[npt.NDArray], list, list, list[npt.NDArray], list, list[npt.NDArray], list[npt.NDArray], list[npt.NDArray]]:
     """
     Retrieve corrected intensity and semantic traces for a channel, enforcing selection rules and experiment length constraints.
     ------------------------------------------------------------------------------------------------------
@@ -28,15 +28,17 @@ def retrieve_traces(
         analysis_df: pd.DataFrame, analysis.xlsx output from `https://github.com/ajitpj/cellapp-analysis`
         wl: str, channel name to process
         frame_interval: int, time between successive frames; sets t_char = 20 // frame_interval
-        exp_length: int, total number of frames in the experiment; used for end-of-trace filtering
         remove_end_mitosis: bool, if True exclude traces that end mitotic at frame exp_length-1; otherwise allow a single end-plateau
     OUTPUTS:
-        intensity_traces: list[npt.NDArray], corrected intensities (intensity - bkg) * intensity_corr
+        intensity_traces: list[npt.NDArray], corrected intensities ((intensity - bkg) * shading) - offset
         semantic_traces: list[npt.NDArray], unpadded semantic traces
-        ids: list, particle identifiers retained
-        first_tps: list, indices of first mitotic call (left base of the detected peak)
         frame_traces: list[npt.NDArray], actual frame numbers for each trace
-        last_mitotic_tps: list, indices of last mitotic call for each trace
+        dead_traces: list, dead_flag values per frame for each trace
+        area_traces: list[npt.NDArray], cell area per frame for each trace
+        ids: list, particle identifiers retained
+        bkg_traces: list[npt.NDArray], per-frame background correction values ({wl}_bkg_corr)
+        shading_traces: list[npt.NDArray], per-frame shading correction factors ({wl}_int_corr)
+        offset_traces: list[npt.NDArray], per-frame offset values subtracted after shading correction
     """
 
     ids = []
@@ -45,6 +47,9 @@ def retrieve_traces(
     frame_traces = []
     dead_traces = []
     area_traces = []
+    bkg_traces = []
+    shading_traces = []
+    offset_traces = []
     t_char = 20 // frame_interval
 
     for id in analysis_df["particle"].unique():
@@ -78,9 +83,12 @@ def retrieve_traces(
         frame_traces.append(frames)
         dead_traces.append(dead)
         area_traces.append(area)
+        bkg_traces.append(bkg)
+        shading_traces.append(shading)
+        offset_traces.append(offset)
         ids.append(id)
 
-    return intensity_traces, semantic_traces, frame_traces, dead_traces, area_traces, ids
+    return intensity_traces, semantic_traces, frame_traces, dead_traces, area_traces, ids, bkg_traces, shading_traces, offset_traces
 
 
 def area_model(N, A_max, f, beta):
@@ -179,9 +187,10 @@ def cycb_chromatin_batch_analyze(
 
         print(f"Working on position: {name_stub}")
 
-        intensity_traces, semantic_traces, frame_traces, dead_traces, cell_area_traces, ids = (
-            retrieve_traces(analysis_df, "GFP", int(frame_interval_minutes))
-        )
+        (
+            intensity_traces, semantic_traces, frame_traces, dead_traces,
+            cell_area_traces, ids, bkg_traces, shading_traces, offset_traces
+        ) = retrieve_traces(analysis_df, "GFP", int(frame_interval_minutes))
 
         degradation_data = pd.DataFrame(
             {
@@ -190,6 +199,9 @@ def cycb_chromatin_batch_analyze(
                 "cycb_intensity": [],
                 "semantic_smoothed": [],
                 'cell_area': [],
+                "bkg": [],
+                "shading": [],
+                "offset": [],
                 "u_area": [],
                 "u_area_intensity": [],
                 "t_area": [],
@@ -255,6 +267,9 @@ def cycb_chromatin_batch_analyze(
                 "cycb_intensity": intensity_traces[i],
                 "semantic_smoothed": semantic_traces[i],
                 "cell_area": cell_area_traces[i],
+                "bkg": bkg_traces[i],
+                "shading": shading_traces[i],
+                "offset": offset_traces[i],
                 "u_area": u_area_trace,
                 "u_area_intensity": u_area_int_trace,
                 "a_area": np.asarray(t_area_trace) - np.asarray(u_area_trace),
@@ -376,7 +391,10 @@ def cycb_batch_analyze_nochrom(
             frame_traces,
             dead_traces,
             cell_area_traces,
-            ids
+            ids,
+            bkg_traces,
+            shading_traces,
+            offset_traces
         ) = retrieve_traces(
             analysis_df,
             "GFP",
@@ -389,6 +407,9 @@ def cycb_batch_analyze_nochrom(
             "cycb_intensity": [],
             "semantic_smoothed": [],
             "cell_area": [],
+            "bkg": [],
+            "shading": [],
+            "offset": [],
             "u_area": [],
             "u_area_intensity": [],
             "a_area": [],
@@ -426,6 +447,9 @@ def cycb_batch_analyze_nochrom(
                 "cycb_intensity": intensity_traces[i],
                 "semantic_smoothed": semantic_traces[i],
                 "cell_area": cell_area_traces[i],
+                "bkg": bkg_traces[i],
+                "shading": shading_traces[i],
+                "offset": offset_traces[i],
                 "u_area": nan_trace,
                 "u_area_intensity": nan_trace,
                 "a_area": nan_trace,
