@@ -6,8 +6,7 @@ import h5py
 import matplotlib.pyplot as plt
 import math
 import sys
-sys.path.append('/Users/whoisv/')
-from uchrom_cycb.changept import deriv_changept
+from changept import deriv_changept
 from skimage.restoration import denoise_tv_chambolle
 from skimage.segmentation import find_boundaries
 from scipy.ndimage import median_filter

@@ -16,11 +16,8 @@ from skimage.exposure import rescale_intensity
 from typing import Optional
 
 
-import sys
-sys.path.append('/Users/whoisv/')
-sys.path.append('/Users/whoisv/uchrom_cycb/')
-from uchrom_cycb.segment_chromatin import determine_removal_mask, airy_disk_psf, segment_unaligned_chromosomes, ChromatinSegConfig
-from uchrom_cycb.degradation import *
+from segment_chromatin import determine_removal_mask, airy_disk_psf, segment_unaligned_chromosomes, ChromatinSegConfig
+from degradation import *
 
 
 def psuedo_cellapp_mask(

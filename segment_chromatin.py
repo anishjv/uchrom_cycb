@@ -23,11 +23,10 @@ import re
 import tifffile as tiff
 
 import sys
-sys.path.append('/Users/whoisv/')
-from uchrom_cycb.deg_analysis import save_chromatin_sources
+from deg_analysis import save_chromatin_sources
 
 _BORDER_DISK = disk(1)
-from uchrom_cycb.extractRect import findRotMaxRect
+from extractRect import findRotMaxRect
 
 @dataclass
 class ChromatinSegConfig:
