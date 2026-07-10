@@ -20,7 +20,7 @@ def retrieve_traces(
     wl: str,
     frame_interval: int,
     remove_end_mitosis: Optional[bool] = False,
-) -> tuple[list[npt.NDArray], list[npt.NDArray], list, list, list[npt.NDArray], list, list[npt.NDArray], list[npt.NDArray], list[npt.NDArray]]:
+) -> tuple[list[npt.NDArray], list[npt.NDArray], list, list, list[npt.NDArray], list, list[npt.NDArray], list[npt.NDArray], list[npt.NDArray], list[npt.NDArray]]:
     """
     Retrieve corrected intensity and semantic traces for a channel, enforcing selection rules and experiment length constraints.
     ------------------------------------------------------------------------------------------------------
@@ -39,10 +39,12 @@ def retrieve_traces(
         bkg_traces: list[npt.NDArray], per-frame background correction values ({wl}_bkg_corr)
         shading_traces: list[npt.NDArray], per-frame shading correction factors ({wl}_int_corr)
         offset_traces: list[npt.NDArray], per-frame offset values subtracted after shading correction
+        raw_intensity_traces: list[npt.NDArray], uncorrected intensities ({wl}) prior to bkg/shading/offset correction
     """
 
     ids = []
     intensity_traces = []
+    raw_intensity_traces = []
     semantic_traces = []
     frame_traces = []
     dead_traces = []
@@ -79,6 +81,7 @@ def retrieve_traces(
 
         corr_intensity = ((intensity - bkg) * shading) - offset
         intensity_traces.append(corr_intensity)
+        raw_intensity_traces.append(intensity)
         semantic_traces.append(semantic)
         frame_traces.append(frames)
         dead_traces.append(dead)
@@ -88,7 +91,7 @@ def retrieve_traces(
         offset_traces.append(offset)
         ids.append(id)
 
-    return intensity_traces, semantic_traces, frame_traces, dead_traces, area_traces, ids, bkg_traces, shading_traces, offset_traces
+    return intensity_traces, semantic_traces, frame_traces, dead_traces, area_traces, ids, bkg_traces, shading_traces, offset_traces, raw_intensity_traces
 
 
 def area_model(N, A_max, f, beta):
@@ -189,7 +192,8 @@ def cycb_chromatin_batch_analyze(
 
         (
             intensity_traces, semantic_traces, frame_traces, dead_traces,
-            cell_area_traces, ids, bkg_traces, shading_traces, offset_traces
+            cell_area_traces, ids, bkg_traces, shading_traces, offset_traces,
+            raw_intensity_traces
         ) = retrieve_traces(analysis_df, "GFP", int(frame_interval_minutes))
 
         degradation_data = pd.DataFrame(
@@ -197,6 +201,7 @@ def cycb_chromatin_batch_analyze(
                 "cell_id": [],
                 "frame": [],
                 "cycb_intensity": [],
+                "cycb_intensity_raw": [],
                 "semantic_smoothed": [],
                 'cell_area': [],
                 "bkg": [],
@@ -265,6 +270,7 @@ def cycb_chromatin_batch_analyze(
                 "cell_id": [cell_id] * len(frames),
                 "frame": frames,
                 "cycb_intensity": intensity_traces[i],
+                "cycb_intensity_raw": raw_intensity_traces[i],
                 "semantic_smoothed": semantic_traces[i],
                 "cell_area": cell_area_traces[i],
                 "bkg": bkg_traces[i],
@@ -394,7 +400,8 @@ def cycb_batch_analyze_nochrom(
             ids,
             bkg_traces,
             shading_traces,
-            offset_traces
+            offset_traces,
+            raw_intensity_traces
         ) = retrieve_traces(
             analysis_df,
             "GFP",
@@ -405,6 +412,7 @@ def cycb_batch_analyze_nochrom(
             "cell_id": [],
             "frame": [],
             "cycb_intensity": [],
+            "cycb_intensity_raw": [],
             "semantic_smoothed": [],
             "cell_area": [],
             "bkg": [],
@@ -445,6 +453,7 @@ def cycb_batch_analyze_nochrom(
                 "cell_id": [cell_id] * n,
                 "frame": frames,
                 "cycb_intensity": intensity_traces[i],
+                "cycb_intensity_raw": raw_intensity_traces[i],
                 "semantic_smoothed": semantic_traces[i],
                 "cell_area": cell_area_traces[i],
                 "bkg": bkg_traces[i],
