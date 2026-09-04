@@ -20,6 +20,11 @@ warnings.filterwarnings("ignore", message="some peaks have a width of 0")
 def validate_cyclin_b_trace(
     trace: np.ndarray,
     semantic: np.ndarray,
+    frame: Optional[np.ndarray] = None,
+    roundup_frame_refined: Optional[float] = None,
+    fast_phs_end_frame: Optional[float] = None,
+    n_frames: int = 10,
+    min_frames: int = 5,
 ):
     """
     Validate whether a trace exhibits expected Cyclin B dynamics around the
@@ -33,6 +38,32 @@ def validate_cyclin_b_trace(
             np.ndarray of semantic state labels over time.
             semantic == 1 is assumed to form one contiguous block of frames.
 
+        frame:
+            Optional[np.ndarray], frame numbers matching trace/semantic,
+            index-aligned. Required (with roundup_frame_refined and
+            fast_phs_end_frame) to evaluate hysteresis_criterion; if omitted,
+            hysteresis_criterion auto-fails.
+
+        roundup_frame_refined:
+            Optional[float], NEB-adjacent anchor frame (see
+            synth_rate_statistics). hysteresis_criterion auto-fails if NaN
+            or not provided.
+
+        fast_phs_end_frame:
+            Optional[float], end of the fast degradation phase (see
+            cp_statistics). hysteresis_criterion auto-fails if NaN or not
+            provided.
+
+        n_frames:
+            int, target number of frames to average on each side of the
+            hysteresis comparison (the closest available frames strictly
+            before roundup_frame_refined / strictly after
+            fast_phs_end_frame). Default 10.
+
+        min_frames:
+            int, minimum number of frames required on each side; fewer than
+            this auto-fails hysteresis_criterion. Default 5.
+
     OUTPUTS:
         peaks_criterion:
             True if the maximum Cyclin B intensity occurs within the
@@ -42,11 +73,14 @@ def validate_cyclin_b_trace(
             True if max(trace) - min(trace) > 10.
 
         hysteresis_criterion:
-            True if the mean Cyclin B intensity in the 1-3 frames BEFORE the
-            semantic == 1 block is greater than the mean intensity in the
-            1-3 frames AFTER the semantic == 1 block.
+            True if the mean Cyclin B intensity in the (up to n_frames,
+            at least min_frames) frames strictly BEFORE roundup_frame_refined
+            is greater than the mean intensity in the (up to n_frames, at
+            least min_frames) frames strictly AFTER fast_phs_end_frame.
 
-            Returns False if insufficient frames exist on either side.
+            Auto-fails (False) if frame/roundup_frame_refined/
+            fast_phs_end_frame are missing or NaN, or if either side has
+            fewer than min_frames available frames.
     """
 
     semantic_1_idx = np.where(semantic == 1)[0]
@@ -69,27 +103,31 @@ def validate_cyclin_b_trace(
     range_criterion = trace_range > 10
 
     # Criterion 3:
-    # Mean before semantic==1 block > mean after block
-    n = len(trace)
-
-    pre_start = max(start - 16, 0)
-    pre_end = max(start - 10, 0)
-
-    post_start = min(end + 1, n)
-    post_end = min(end + 6, n)
-
-    valid_windows = (
-        (pre_end-pre_start) > 2 and
-        (post_end-post_start) > 2
-    )
-
-    if valid_windows:
-        pre_vals = trace[pre_start:pre_end]
-        post_vals = trace[post_start:post_end]
-
-        hysteresis_criterion = np.mean(pre_vals) > np.mean(post_vals)
-    else:
+    # Mean before roundup_frame_refined > mean after fast_phs_end_frame
+    if (
+        frame is None or
+        roundup_frame_refined is None or
+        fast_phs_end_frame is None or
+        pd.isna(roundup_frame_refined) or
+        pd.isna(fast_phs_end_frame)
+    ):
         hysteresis_criterion = False
+    else:
+        frame = np.asarray(frame)
+
+        pre_idx = np.where(frame < roundup_frame_refined)[0]
+        post_idx = np.where(frame > fast_phs_end_frame)[0]
+
+        # Closest available frames to each anchor, capped at n_frames
+        pre_idx = pre_idx[np.argsort(frame[pre_idx])][-n_frames:]
+        post_idx = post_idx[np.argsort(frame[post_idx])][:n_frames]
+
+        if len(pre_idx) < min_frames or len(post_idx) < min_frames:
+            hysteresis_criterion = False
+        else:
+            hysteresis_criterion = bool(
+                np.mean(trace[pre_idx]) > np.mean(trace[post_idx])
+            )
 
     return peaks_criterion, range_criterion, hysteresis_criterion
 
@@ -135,12 +173,10 @@ def compute_semantic_contig(df: pd.DataFrame) -> pd.Series:
 
 
 def aggregate_clean_dfs(
-    paths: list[str], 
+    paths: list[str],
     datewell_keep: Optional[list[str]]=None,
     pos_avoid: Optional[list[str]]=None,
-    filters: Optional[list[str]]=None,
-    return_failed: bool = False
-    ) -> tuple[pd.DataFrame, ...]:
+    ) -> tuple[pd.DataFrame, pd.DataFrame]:
 
     '''
     Aggregates chromatin.xlsx dataframes
@@ -149,24 +185,22 @@ def aggregate_clean_dfs(
         paths: list[str], list of paths to chromatin.xlsx files
         datewell_keep: Optional[list[str]], datewells to aggregate
         pos_avoid: Optional[list[str]], positions to avoid
-        filters: Optional[list[str]], QC filters to apply
-        return_failed: bool, if True, returns passing and failing dfs
     OUTPUTS:
-        If return_failed is False: (df_agg_c, df_agg_qc)
-        If return_failed is True:  (df_agg_c, df_agg_qc, df_failed_c, df_failed_qc)
+        (df_agg, df_agg_qc): per-timepoint and per-cell dataframes, unfiltered.
+            Run add_addl_metrics() then filter_qc_cells() downstream to compute
+            QC criteria and apply QC filters.
     '''
 
     dfs = []
     qc_dfs = []
-    failed_qc_dfs = []
 
     for f in paths:
         date_match = re.search(r"20\d{2}(0[1-9]|1[0-2])(0[1-9]|[12][0-9]|3[01])", str(f))
         well_match = re.search(r"[A-H]([1-9]|0[1-9]|1[0-2])_s(\d{1,2})", str(f))
-        
+
         if not (date_match and well_match):
             continue
-            
+
         date, well = date_match.group(), well_match.group()
 
         if datewell_keep and not any(stub in date + well[0] for stub in datewell_keep):
@@ -178,101 +212,76 @@ def aggregate_clean_dfs(
 
         df = pd.read_excel(f)
         df_qc = pd.read_excel(f, sheet_name=1)
-        
-        #TODO: rerun deg so that these columns don't exist
-        # Remove old columns first
-        cols_to_replace = [
-            "peaks_criterion",
-            "range_criterion",
-            "hysteresis_criterion",
-        ]
-
-        df_qc = df_qc.drop(
-            columns=[c for c in cols_to_replace if c in df_qc.columns]
-        )
 
         # Basic ID tagging
         for d in [df, df_qc]:
             d["date"], d["well"] = date, well
             d["date-well"] = d["date"] + d["well"].str[0]
 
-        # Compute largest contiguous mitotic region
-        df["semantic_contig"] = (
-            df
-            .groupby(["cell_id"], sort=False)
-            .apply(compute_semantic_contig, include_groups=False)
-            .reset_index(level=0, drop=True)
-        )
-
-        # Smooth before QC criteria so validate_cyclin_b_trace operates on smoothed trace
-        df["cycb_smoothed"] = (
-            df.groupby("cell_id", sort=False)["cycb_intensity"]
-            .transform(lambda x: adaptive_bilateral_1d(
-                x, sigma_min=1.0, sigma_range_min=3.0, min_int=10, gain=1.0, read_noise_var=4.0
-            ))
-        )
-
-        # Feature Calculations
-        criteria = (
-            df.sort_values(["cell_id", "frame"])
-            .groupby("cell_id")
-            .apply(
-                lambda g: pd.Series(
-                    validate_cyclin_b_trace(
-                        trace=g["cycb_smoothed"].values,
-                        semantic=g["semantic_contig"].values,
-                    ),
-                    index=[
-                        "peaks_criterion",
-                        "range_criterion",
-                        "hysteresis_criterion"
-                    ],
-                ), include_groups=False
-            )
-            .reset_index()
-        )
-
-        # Merge criteria into df_qc
-        df_qc = df_qc.merge(criteria, on="cell_id", how="left")
-
-        QC_RULES = {
-            "num_dead_flags": lambda d: d["num_dead_flags"] <= 5,
-            "plate_gsk": lambda d: d["plate_removal_freq"] >= 0.5,
-            "plate_noc": lambda d: d["plate_removal_freq"] < 0.5,
-            "range_criterion": lambda d: d["range_criterion"].astype(int) == 1,
-            "exited_mitosis": lambda d: d["ends_in_mitosis"].astype(int) == 0,
-            "time_in_mitosis_noc": lambda d: d["time_in_mitosis"] >= 40,
-            "cellapp_start": lambda d: d["peaks_criterion"].astype(int) == 1,
-            "cellapp_end": lambda d: d["hysteresis_criterion"].astype(int) == 1,
-        }
-
-        qc_mask = pd.Series(True, index=df_qc.index)
-        if filters:
-            for f_name in filters:
-                if f_name in QC_RULES:
-                    qc_mask &= QC_RULES[f_name](df_qc)
-                else:
-                    raise ValueError(f"Unknown QC filter: {f_name}")
-
-        # Store results
         dfs.append(df)
-        qc_dfs.append(df_qc.loc[qc_mask].copy())
-        failed_qc_dfs.append(df_qc.loc[~qc_mask].copy())
+        qc_dfs.append(df_qc)
 
     df_agg = pd.concat(dfs, ignore_index=True)
     df_agg_qc = pd.concat(qc_dfs, ignore_index=True)
-    df_failed_qc = pd.concat(failed_qc_dfs, ignore_index=True)
 
-    failed_index = pd.MultiIndex.from_frame(df_failed_qc[["cell_id", "date", "well"]])
+    return df_agg, df_agg_qc
+
+
+def filter_qc_cells(
+    df_agg: pd.DataFrame,
+    df_agg_qc: pd.DataFrame,
+    filters: Optional[list[str]] = None,
+    return_failed: bool = False,
+    ) -> tuple[pd.DataFrame, ...]:
+
+    '''
+    Applies QC filters to the aggregated dataframes.
+    --------------------------------------------------------------------------
+    Must run after add_addl_metrics(), since several QC rules (range_criterion,
+    cellapp_start, cellapp_end) depend on 'peaks_criterion', 'range_criterion',
+    and 'hysteresis_criterion' columns computed there via validate_cyclin_b_trace().
+    INPUTS:
+        df_agg: pd.DataFrame, per-timepoint output of add_addl_metrics()
+        df_agg_qc: pd.DataFrame, per-cell output of add_addl_metrics()
+        filters: Optional[list[str]], QC filters to apply (keys of QC_RULES)
+        return_failed: bool, if True, also returns cells that failed QC
+    OUTPUTS:
+        If return_failed is False: (df_agg_c, df_agg_qc_pass)
+        If return_failed is True:  (df_agg_c, df_agg_qc_pass, df_failed_c, df_agg_qc_fail)
+    '''
+
+    QC_RULES = {
+        "num_dead_flags": lambda d: d["num_dead_flags"] <= 5,
+        "plate_gsk": lambda d: d["plate_removal_freq"] >= 0.5,
+        "plate_noc": lambda d: d["plate_removal_freq"] < 0.5,
+        "range_criterion": lambda d: d["range_criterion"].astype(int) == 1,
+        "exited_mitosis": lambda d: d["ends_in_mitosis"].astype(int) == 0,
+        "time_in_mitosis_noc": lambda d: d["time_in_mitosis"] >= 40,
+        "cellapp_start": lambda d: d["peaks_criterion"].astype(int) == 1,
+        "cellapp_end": lambda d: d["hysteresis_criterion"].astype(int) == 1,
+    }
+
+    qc_mask = pd.Series(True, index=df_agg_qc.index)
+    if filters:
+        for f_name in filters:
+            if f_name in QC_RULES:
+                qc_mask &= QC_RULES[f_name](df_agg_qc)
+            else:
+                raise ValueError(f"Unknown QC filter: {f_name}")
+
+    df_agg_qc_pass = df_agg_qc.loc[qc_mask].copy()
+    df_agg_qc_fail = df_agg_qc.loc[~qc_mask].copy()
+
+    failed_index = pd.MultiIndex.from_frame(df_agg_qc_fail[["cell_id", "date", "well"]])
     agg_index = pd.MultiIndex.from_frame(df_agg[["cell_id", "date", "well"]])
 
     df_agg_c = df_agg[~agg_index.isin(failed_index)]
-    
+
     if return_failed:
         df_failed_c = df_agg[agg_index.isin(failed_index)]
-        return df_agg_c, df_agg_qc, df_failed_c, df_failed_qc
-        
-    return df_agg_c, df_agg_qc
+        return df_agg_c, df_agg_qc_pass, df_failed_c, df_agg_qc_fail
+
+    return df_agg_c, df_agg_qc_pass
 
 
 def cp_statistics(
@@ -658,8 +667,11 @@ def synth_rate_statistics(group, df_agg_qc, min_seg=3):
     before and after NEB.
 
     Strategy:
-    1. Detect likely NEB timing from the largest positive jump in
-       Cyclin B intensity near roundup_start_frame.
+    1. Detect likely NEB timing as the left base (rel_height=0.75) of the
+       most prominent peak in d(cycb_smoothed)/dt (i.e. -cycb_deg_rate,
+       computed on the full trace) within a window from 10 frames before
+       roundup_start_frame through the first point after max_cycb_frame
+       where the derivative goes negative.
 
     2. Define matched windows:
            back  = pre-NEB
@@ -668,6 +680,11 @@ def synth_rate_statistics(group, df_agg_qc, min_seg=3):
        while excluding frames immediately surrounding NEB.
 
     3. Compute mean derivative-based rates within each window.
+
+    NOTE: ksynth_front_start/ksynth_back_end apply fixed offsets (+2/-4
+    frames) to roundup_frame_refined. Those offsets were tuned against the
+    previous jump-based definition of roundup_frame_refined; since the
+    definition above changed, they may need to be retuned.
     ------------------------------------------------------------------
     REQUIRED COLUMNS:
         group:
@@ -724,28 +741,50 @@ def synth_rate_statistics(group, df_agg_qc, min_seg=3):
         return nan_return
 
     frames = group["frame"].to_numpy()
-    y = group["cycb_smoothed"].to_numpy()
+    deriv = -group["cycb_deg_rate"].to_numpy()  # d(cycb_smoothed)/dt; positive = rising cycb
 
-    # Detect NEB-associated influx jump
+    # Search window: from 10 frames before roundup_start_frame (or the trace
+    # start, whichever comes later) through the first point after
+    # max_cycb_frame where the derivative goes negative (confirming decline
+    # has begun).
+    search_start_frame = t_roundup_start - 10
+
+    post_max_mask = frames > t_max
+    post_max_frames = frames[post_max_mask]
+    post_max_deriv = deriv[post_max_mask]
+
+    if len(post_max_frames) == 0:
+        search_end_frame = t_max
+    else:
+        negative_after_max = np.where(post_max_deriv < 0)[0]
+        if len(negative_after_max) == 0:
+            # Derivative never dips negative after the peak — max_cycb_frame
+            # isn't a trustworthy peak and we can't bound the window safely.
+            return nan_return
+
+        search_end_frame = post_max_frames[negative_after_max[0]]
+
     search_mask = (
-        (frames >= t_roundup_start - 10) &
-        (frames <= t_roundup_start + 10)
+        (frames >= search_start_frame) &
+        (frames <= search_end_frame)
     )
 
     if np.sum(search_mask) < min_seg:
         return nan_return
 
     search_frames = frames[search_mask]
-    search_y = y[search_mask]
+    search_deriv = deriv[search_mask]
 
-    diffs = np.diff(search_y)
+    peaks, props = find_peaks(search_deriv, prominence=0)
 
-    if len(diffs) == 0:
+    if len(peaks) == 0:
         return nan_return
 
-    # largest positive jump = likely NEB-associated influx
-    jump_idx = np.argmax(diffs)
-    roundup_frame_refined = search_frames[jump_idx + 1]
+    # Most prominent peak = the dominant NEB-associated influx event
+    peak_idx = peaks[np.argmax(props["prominences"])]
+
+    _, _, left_ips, _ = peak_widths(search_deriv, [peak_idx], rel_height=0.9)
+    roundup_frame_refined = search_frames[int(np.floor(left_ips[0]))]
 
     # Define post-NEB window
     ksynth_front_start = roundup_frame_refined + 2
@@ -820,7 +859,15 @@ def synth_rate_statistics(group, df_agg_qc, min_seg=3):
     )
 
 
-def adaptive_bilateral_1d(x, sigma_min=1.0, sigma_range_min=3.0, min_int=10, gain=1.0, read_noise_var=4.0):
+def adaptive_bilateral_1d(
+        x, 
+        sigma_min=1.0, 
+        sigma_max=30.0, 
+        sigma_range_min=2.0, 
+        min_int=10, 
+        gain=1.0, 
+        read_noise_var=4.0
+        ):
     """
     Smooths a 1D array using a bilateral filter whose spatial and range sigmas
     both scale with local shot noise variance. The range sigma prevents cross-edge
@@ -851,8 +898,8 @@ def adaptive_bilateral_1d(x, sigma_min=1.0, sigma_range_min=3.0, min_int=10, gai
 
     noise_ratio = var_pilot / var_min
 
-    sigmas       = np.maximum(sigma_min,       sigma_min       * noise_ratio)
-    sigmas       = np.minimum(max(sigma_min, n / 24), sigmas)
+    sigmas       = np.maximum(sigma_min,  sigma_min * noise_ratio)
+    sigmas       = np.minimum(sigma_max, sigmas)
     sigma_ranges = np.maximum(sigma_range_min, sigma_range_min * noise_ratio)
 
     smoothed = np.zeros_like(x, dtype=float)
@@ -911,7 +958,9 @@ def floor_cycb_statistics(group: pd.DataFrame, anaphase_end_frame, window: int =
 
 
 def add_addl_metrics(
-    df_agg: pd.DataFrame, df_agg_qc: pd.DataFrame, noc: Optional[bool] = False
+    df_agg: pd.DataFrame, 
+    df_agg_qc: pd.DataFrame, 
+    noc: Optional[bool] = False
 ) -> tuple[pd.DataFrame]:
 
     """
@@ -920,9 +969,25 @@ def add_addl_metrics(
     INPUTS:
         df_agg: pd.DataFrame, per-timepoint output of aggregate_clean_dfs()
         df_agg_qc: pd.DataFrame, per-cell output of aggregate_clean_dfs()
+        noc: Optional[bool], if True, applies changepoint remediation for
+            nocodazole-treated cells (see cp_statistics)
+    OUTPUTS:
+        (df_agg, df_agg_qc): pd.DataFrame tuple with added columns, including
+            'semantic_contig', 'peaks_criterion', 'range_criterion', and
+            'hysteresis_criterion' used downstream by filter_qc_cells().
     """
 
     cp_remediate = False if not noc else True
+
+    # Largest contiguous mitotic block; gates validate_cyclin_b_trace below and
+    # is the authoritative mitotic window for cp/area-jump/max-intensity metrics.
+    if "semantic_contig" not in df_agg.columns:
+        df_agg["semantic_contig"] = (
+            df_agg
+            .groupby(["cell_id", "date", "well"], sort=False)
+            .apply(compute_semantic_contig, include_groups=False)
+            .reset_index(level=[0, 1, 2], drop=True)
+        )
 
     if "cycb_smoothed" not in df_agg.columns:
         df_agg["cycb_smoothed"] = (
@@ -932,6 +997,13 @@ def add_addl_metrics(
                 x, sigma_min=1.0, sigma_range_min=3.0, min_int=10, gain=1.0, read_noise_var=4.0
             ))
         )
+
+    #TODO: rerun deg so that these columns don't exist in chromatin.xlsx
+    # Drop stale criteria columns (from old xlsx exports) before recomputing/merging
+    cols_to_replace = ["peaks_criterion", "range_criterion", "hysteresis_criterion"]
+    df_agg_qc = df_agg_qc.drop(
+        columns=[c for c in cols_to_replace if c in df_agg_qc.columns]
+    )
 
     df_agg["cycb_deg_rate"] = (
         df_agg
@@ -989,6 +1061,7 @@ def add_addl_metrics(
 
     # 5. Get Cyclin B floor after anaphase
     qc_indexed = df_agg_qc.set_index(["date", "well", "cell_id"])
+
     floor_info = (
         df_agg.groupby(["date", "well", "cell_id"])
         .apply(
@@ -1011,6 +1084,39 @@ def add_addl_metrics(
     )
     df_agg_qc = df_agg_qc.merge(synth_info, on=["date", "well", "cell_id"], how="left")
 
+    # QC criteria: biological plausibility of the Cyclin B trace. Must run
+    # after cp_info/synth_info are merged above, since hysteresis_criterion
+    # depends on fast_phs_end_frame and roundup_frame_refined.
+    qc_indexed = df_agg_qc.set_index(["date", "well", "cell_id"])
+
+    criteria = (
+        df_agg.sort_values(["date", "well", "cell_id", "frame"])
+        .groupby(["date", "well", "cell_id"])
+        .apply(
+            lambda g: pd.Series(
+                validate_cyclin_b_trace(
+                    trace=g["cycb_smoothed"].values,
+                    semantic=g["semantic_contig"].values,
+                    frame=g["frame"].values,
+                    roundup_frame_refined=(
+                        qc_indexed.loc[g.name, "roundup_frame_refined"]
+                        if g.name in qc_indexed.index else np.nan
+                    ),
+                    fast_phs_end_frame=(
+                        qc_indexed.loc[g.name, "fast_phs_end_frame"]
+                        if g.name in qc_indexed.index else np.nan
+                    ),
+                ),
+                index=[
+                    "peaks_criterion",
+                    "range_criterion",
+                    "hysteresis_criterion"
+                ],
+            ), include_groups=False
+        )
+        .reset_index()
+    )
+    df_agg_qc = df_agg_qc.merge(criteria, on=["date", "well", "cell_id"], how="left")
 
     return df_agg, df_agg_qc
 
