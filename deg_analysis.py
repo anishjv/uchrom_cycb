@@ -232,6 +232,7 @@ def filter_qc_cells(
     df_agg_qc: pd.DataFrame,
     filters: Optional[list[str]] = None,
     return_failed: bool = False,
+    drop_ifna_cols: Optional[list[str]] = None,
     ) -> tuple[pd.DataFrame, ...]:
 
     '''
@@ -245,6 +246,8 @@ def filter_qc_cells(
         df_agg_qc: pd.DataFrame, per-cell output of add_addl_metrics()
         filters: Optional[list[str]], QC filters to apply (keys of QC_RULES)
         return_failed: bool, if True, also returns cells that failed QC
+        drop_ifna_cols: Optional[list[str]], df_agg_qc columns to check for NaN;
+            a cell is dropped if any of these columns is NaN for that cell
     OUTPUTS:
         If return_failed is False: (df_agg_c, df_agg_qc_pass)
         If return_failed is True:  (df_agg_c, df_agg_qc_pass, df_failed_c, df_agg_qc_fail)
@@ -268,6 +271,9 @@ def filter_qc_cells(
                 qc_mask &= QC_RULES[f_name](df_agg_qc)
             else:
                 raise ValueError(f"Unknown QC filter: {f_name}")
+
+    if drop_ifna_cols:
+        qc_mask &= df_agg_qc[drop_ifna_cols].notna().all(axis=1)
 
     df_agg_qc_pass = df_agg_qc.loc[qc_mask].copy()
     df_agg_qc_fail = df_agg_qc.loc[~qc_mask].copy()
