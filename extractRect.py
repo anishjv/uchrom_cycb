@@ -110,11 +110,8 @@ def findRotMaxRect(data_in,flag_opt=False,flag_parallel = False, nbre_angle=10,f
         n = max([nx_in,ny_in])
         data_square = np.ones([n,n])
         xshift = old_div((n-nx_in),2)
-        yshift = old_div((n-ny_in),2) 
-        if yshift == 0:
-            data_square[xshift:(xshift+nx_in),:                 ] = data_in[:,:]
-        else: 
-            data_square[:                 ,yshift:(yshift+ny_in)] = data_in[:,:]
+        yshift = old_div((n-ny_in),2)
+        data_square[xshift:(xshift+nx_in), yshift:(yshift+ny_in)] = data_in[:,:]
     else:
         xshift = 0
         yshift = 0

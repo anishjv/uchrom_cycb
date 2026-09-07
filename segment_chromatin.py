@@ -257,7 +257,11 @@ def get_largest_signal_regions(
     cell_in_mask = np.copy(tophat_cell)
     cell_in_mask[~cell_mask] = 0
 
-    thresh = threshold_otsu(cell_in_mask[cell_in_mask > 0])
+    positive_pixels = cell_in_mask[cell_in_mask > 0]
+    if positive_pixels.size == 0:
+        return np.zeros_like(cell_in_mask, dtype=int), None
+
+    thresh = threshold_otsu(positive_pixels)
     thresh_cell = cell_in_mask > thresh
     labeled, num_labels = label(thresh_cell, return_num=True)
 
