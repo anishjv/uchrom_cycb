@@ -15,54 +15,136 @@ import sys
 import h5py
 
 
-def retrieve_traces(
-    analysis_df: pd.DataFrame,
-    wl: str,
-    frame_interval: int,
-    remove_end_mitosis: Optional[bool] = False,
-) -> tuple[list[npt.NDArray], list[npt.NDArray], list, list, list[npt.NDArray], list, list[npt.NDArray], list[npt.NDArray], list[npt.NDArray], list[npt.NDArray]]:
+def resolve_channel_columns(analysis_df: pd.DataFrame, wl: str) -> dict[str, str]:
     """
-    Retrieve corrected intensity and semantic traces for a channel, enforcing selection rules and experiment length constraints.
+    Map a channel to the analysis.xlsx columns holding its raw intensity and corrections.
     ------------------------------------------------------------------------------------------------------
     INPUTS:
         analysis_df: pd.DataFrame, analysis.xlsx output from `https://github.com/ajitpj/cellapp-analysis`
-        wl: str, channel name to process
+        wl: str, channel name (e.g. 'GFP', 'Texas Red')
+    OUTPUTS:
+        columns: dict[str, str], {'intensity', 'bkg', 'shading', 'offset'} -> column name in analysis_df
+    RAISES:
+        KeyError, if any required column for the channel is missing
+    """
+    columns = {
+        "intensity": f"{wl}",
+        "bkg": f"{wl}_bkg_corr",
+        "shading": f"{wl}_int_corr",
+        "offset": f"{wl}_offset",
+    }
+    # Files processed before bkg_plotting went multi-channel hold a single GFP-derived 'offset'
+    # column; it is only valid for GFP, so other channels must have their own '{wl}_offset'.
+    if columns["offset"] not in analysis_df.columns and wl == "GFP":
+        columns["offset"] = "offset"
+
+    missing = [col for col in columns.values() if col not in analysis_df.columns]
+    if missing:
+        raise KeyError(f"channel '{wl}' is missing column(s) {missing}")
+    return columns
+
+
+def output_column_names(wl: str) -> dict[str, str]:
+    """
+    Output (degradation_data) column names for a channel's per-frame traces.
+    ------------------------------------------------------------------------------------------------------
+    INPUTS:
+        wl: str, channel name
+    OUTPUTS:
+        names: dict[str, str], {'intensity', 'intensity_raw', 'bkg', 'shading', 'offset'} -> output column name
+    """
+    # GFP keeps the pre-multichannel names because deg_analysis.py and other consumers read them
+    if wl == "GFP":
+        return {
+            "intensity": "cycb_intensity",
+            "intensity_raw": "cycb_intensity_raw",
+            "bkg": "bkg",
+            "shading": "shading",
+            "offset": "offset",
+        }
+    return {key: f"{wl}_{key}" for key in ["intensity", "intensity_raw", "bkg", "shading", "offset"]}
+
+
+def channel_trace_columns(
+    channels: list[str],
+    i: int,
+    intensity_traces: dict[str, list[npt.NDArray]],
+    raw_intensity_traces: dict[str, list[npt.NDArray]],
+    bkg_traces: dict[str, list[npt.NDArray]],
+    shading_traces: dict[str, list[npt.NDArray]],
+    offset_traces: dict[str, list[npt.NDArray]],
+) -> tuple[dict[str, npt.NDArray], dict[str, npt.NDArray]]:
+    """
+    Build the per-channel output columns for the i-th retained cell.
+    ------------------------------------------------------------------------------------------------------
+    INPUTS:
+        channels: list[str], channels analyzed
+        i: int, index of the cell in the retrieve_traces outputs
+        intensity_traces ... offset_traces: dict[str, list[npt.NDArray]], per-channel outputs of retrieve_traces
+    OUTPUTS:
+        intensity_cols: dict[str, npt.NDArray], {output column: trace} for corrected and raw intensity
+        correction_cols: dict[str, npt.NDArray], {output column: trace} for bkg, shading, and offset
+    """
+    intensity_cols = {}
+    correction_cols = {}
+    for wl in channels:
+        names = output_column_names(wl)
+        intensity_cols[names["intensity"]] = intensity_traces[wl][i]
+        intensity_cols[names["intensity_raw"]] = raw_intensity_traces[wl][i]
+        correction_cols[names["bkg"]] = bkg_traces[wl][i]
+        correction_cols[names["shading"]] = shading_traces[wl][i]
+        correction_cols[names["offset"]] = offset_traces[wl][i]
+    return intensity_cols, correction_cols
+
+
+def retrieve_traces(
+    analysis_df: pd.DataFrame,
+    channels: list[str],
+    frame_interval: int,
+    remove_end_mitosis: Optional[bool] = False,
+) -> tuple[dict[str, list[npt.NDArray]], list[npt.NDArray], list, list[npt.NDArray], list, dict[str, list[npt.NDArray]], dict[str, list[npt.NDArray]], dict[str, list[npt.NDArray]], dict[str, list[npt.NDArray]]]:
+    """
+    Retrieve corrected intensity traces for each channel plus shared semantic traces, enforcing selection rules and experiment length constraints.
+    ------------------------------------------------------------------------------------------------------
+    INPUTS:
+        analysis_df: pd.DataFrame, analysis.xlsx output from `https://github.com/ajitpj/cellapp-analysis`
+        channels: list[str], channel names to process (e.g. ['GFP', 'Texas Red'])
         frame_interval: int, time between successive frames; sets t_char = 20 // frame_interval
         remove_end_mitosis: bool, if True exclude traces that end mitotic at frame exp_length-1; otherwise allow a single end-plateau
     OUTPUTS:
-        intensity_traces: list[npt.NDArray], corrected intensities ((intensity - bkg) * shading) - offset
+        intensity_traces: dict[str, list[npt.NDArray]], per channel, corrected intensities ((intensity - bkg) * shading) - offset
         semantic_traces: list[npt.NDArray], unpadded semantic traces
         frame_traces: list[npt.NDArray], actual frame numbers for each trace
-        dead_traces: list, dead_flag values per frame for each trace
         area_traces: list[npt.NDArray], cell area per frame for each trace
         ids: list, particle identifiers retained
-        bkg_traces: list[npt.NDArray], per-frame background correction values ({wl}_bkg_corr)
-        shading_traces: list[npt.NDArray], per-frame shading correction factors ({wl}_int_corr)
-        offset_traces: list[npt.NDArray], per-frame offset values subtracted after shading correction
-        raw_intensity_traces: list[npt.NDArray], uncorrected intensities ({wl}) prior to bkg/shading/offset correction
+        bkg_traces: dict[str, list[npt.NDArray]], per channel, per-frame background correction values ({wl}_bkg_corr)
+        shading_traces: dict[str, list[npt.NDArray]], per channel, per-frame shading correction factors ({wl}_int_corr)
+        offset_traces: dict[str, list[npt.NDArray]], per channel, per-frame offsets ({wl}_offset, or legacy 'offset' for GFP)
+        raw_intensity_traces: dict[str, list[npt.NDArray]], per channel, uncorrected intensities ({wl}) prior to bkg/shading/offset correction
+        Per-channel lists are index-aligned with ids.
+    RAISES:
+        KeyError, if a required column for any channel is missing (see resolve_channel_columns)
     """
 
+    # Resolve up front so a missing column fails before any traces are built
+    channel_columns = {wl: resolve_channel_columns(analysis_df, wl) for wl in channels}
+
     ids = []
-    intensity_traces = []
-    raw_intensity_traces = []
     semantic_traces = []
     frame_traces = []
-    dead_traces = []
     area_traces = []
-    bkg_traces = []
-    shading_traces = []
-    offset_traces = []
+    intensity_traces = {wl: [] for wl in channels}
+    raw_intensity_traces = {wl: [] for wl in channels}
+    bkg_traces = {wl: [] for wl in channels}
+    shading_traces = {wl: [] for wl in channels}
+    offset_traces = {wl: [] for wl in channels}
     t_char = 20 // frame_interval
 
     for id in analysis_df["particle"].unique():
-        intensity = analysis_df.query(f"particle=={id}")[f"{wl}"].to_numpy()
-        area = analysis_df.query(f"particle=={id}")["area"].to_numpy()
-        semantic = analysis_df.query(f"particle=={id}")["semantic_smoothed"].to_numpy()
-        bkg = analysis_df.query(f"particle=={id}")[f"{wl}_bkg_corr"].to_numpy()
-        shading = analysis_df.query(f"particle=={id}")[f"{wl}_int_corr"].to_numpy()
-        offset = analysis_df.query(f"particle=={id}")["offset"].to_numpy()
-        frames = analysis_df.query(f"particle=={id}")["frame"].to_numpy()
-        dead = analysis_df.query(f"particle=={id}")["dead_flag"].to_numpy()
+        cell_df = analysis_df.query(f"particle=={id}")
+        area = cell_df["area"].to_numpy()
+        semantic = cell_df["semantic_smoothed"].to_numpy()
+        frames = cell_df["frame"].to_numpy()
 
         # Always remove traces that start in mitosis
         if semantic[0] == 1:
@@ -79,19 +161,24 @@ def retrieve_traces(
         if props["widths"].size != 1:
             continue
 
-        corr_intensity = ((intensity - bkg) * shading) - offset
-        intensity_traces.append(corr_intensity)
-        raw_intensity_traces.append(intensity)
+        for wl, cols in channel_columns.items():
+            intensity = cell_df[cols["intensity"]].to_numpy()
+            bkg = cell_df[cols["bkg"]].to_numpy()
+            shading = cell_df[cols["shading"]].to_numpy()
+            offset = cell_df[cols["offset"]].to_numpy()
+
+            intensity_traces[wl].append(((intensity - bkg) * shading) - offset)
+            raw_intensity_traces[wl].append(intensity)
+            bkg_traces[wl].append(bkg)
+            shading_traces[wl].append(shading)
+            offset_traces[wl].append(offset)
+
         semantic_traces.append(semantic)
         frame_traces.append(frames)
-        dead_traces.append(dead)
         area_traces.append(area)
-        bkg_traces.append(bkg)
-        shading_traces.append(shading)
-        offset_traces.append(offset)
         ids.append(id)
 
-    return intensity_traces, semantic_traces, frame_traces, dead_traces, area_traces, ids, bkg_traces, shading_traces, offset_traces, raw_intensity_traces
+    return intensity_traces, semantic_traces, frame_traces, area_traces, ids, bkg_traces, shading_traces, offset_traces, raw_intensity_traces
 
 
 def area_model(N, A_max, f, beta):
@@ -146,7 +233,8 @@ def cycb_chromatin_batch_analyze(
     chromatin_paths: list,
     frame_interval_minutes: float = 4.0,
     config: Optional[object] = None,
-    version: Optional[str] = None
+    version: Optional[str] = None,
+    channels: Optional[list[str]] = None
 ) -> tuple[pd.DataFrame]:
     """
     Batch analyze chromatin segmentation for multiple positions.
@@ -158,12 +246,16 @@ def cycb_chromatin_batch_analyze(
         chromatin_paths: list, paths to chromatin movie files
         frame_interval_minutes: float, time between frames in minutes
         config: Optional[ChromatinSegConfig], configuration parameters
+        version: Optional[str], suffix appended to output filenames
+        channels: Optional[list[str]], fluorescence channels to extract traces for; defaults to ['GFP']
     OUTPUTS:
         None (saves Excel files to disk)
     """
 
     if config is None:
         config = ChromatinSegConfig()
+    if channels is None:
+        channels = ["GFP"]
 
     for name_stub, analysis_path, instance_path, chromatin_path in zip(
         positions, analysis_paths, instance_paths, chromatin_paths
@@ -190,23 +282,28 @@ def cycb_chromatin_batch_analyze(
 
         print(f"Working on position: {name_stub}")
 
-        (
-            intensity_traces, semantic_traces, frame_traces, dead_traces,
-            cell_area_traces, ids, bkg_traces, shading_traces, offset_traces,
-            raw_intensity_traces
-        ) = retrieve_traces(analysis_df, "GFP", int(frame_interval_minutes))
+        try:
+            (
+                intensity_traces, semantic_traces, frame_traces,
+                cell_area_traces, ids, bkg_traces, shading_traces, offset_traces,
+                raw_intensity_traces
+            ) = retrieve_traces(analysis_df, channels, int(frame_interval_minutes))
+        except KeyError as err:
+            print(f"Skipping position {name_stub}: {err.args[0]} in {analysis_path}")
+            continue
+
+        channel_names = [output_column_names(wl) for wl in channels]
+        intensity_names = [names[key] for names in channel_names for key in ("intensity", "intensity_raw")]
+        correction_names = [names[key] for names in channel_names for key in ("bkg", "shading", "offset")]
 
         degradation_data = pd.DataFrame(
             {
                 "cell_id": [],
                 "frame": [],
-                "cycb_intensity": [],
-                "cycb_intensity_raw": [],
+                **{col: [] for col in intensity_names},
                 "semantic_smoothed": [],
                 'cell_area': [],
-                "bkg": [],
-                "shading": [],
-                "offset": [],
+                **{col: [] for col in correction_names},
                 "u_area": [],
                 "u_area_intensity": [],
                 "t_area": [],
@@ -222,7 +319,6 @@ def cycb_chromatin_batch_analyze(
 
         for i, cell_id in enumerate(ids):
 
-            num_dead_flags = np.sum(semantic_traces[i] * dead_traces[i])
             time_in_mitosis = np.sum(semantic_traces[i])
 
             ends_in_mitosis = (semantic_traces[i][-1] == 1)
@@ -265,17 +361,18 @@ def cycb_chromatin_batch_analyze(
                 u_num_high_trace.append(u_num_high)
 
             frames = frame_traces[i]
+            intensity_cols, correction_cols = channel_trace_columns(
+                channels, i, intensity_traces, raw_intensity_traces,
+                bkg_traces, shading_traces, offset_traces
+            )
 
             cell_data = {
                 "cell_id": [cell_id] * len(frames),
                 "frame": frames,
-                "cycb_intensity": intensity_traces[i],
-                "cycb_intensity_raw": raw_intensity_traces[i],
+                **intensity_cols,
                 "semantic_smoothed": semantic_traces[i],
                 "cell_area": cell_area_traces[i],
-                "bkg": bkg_traces[i],
-                "shading": shading_traces[i],
-                "offset": offset_traces[i],
+                **correction_cols,
                 "u_area": u_area_trace,
                 "u_area_intensity": u_area_int_trace,
                 "a_area": np.asarray(t_area_trace) - np.asarray(u_area_trace),
@@ -300,7 +397,6 @@ def cycb_chromatin_batch_analyze(
                     "track_start": frames[0],
                     "track_end": frames[-1],
                     "plate_removal_freq": removal_freq,
-                    "num_dead_flags": num_dead_flags,
                     "time_in_mitosis": time_in_mitosis,
                     "ends_in_mitosis": ends_in_mitosis
                 }
@@ -354,20 +450,26 @@ def cycb_batch_analyze_nochrom(
     analysis_paths: list,
     instance_paths: list,
     frame_interval_minutes: float = 4.0,
-    version: Optional[str] = None
+    version: Optional[str] = None,
+    channels: Optional[list[str]] = None
 ) -> None:
 
     """
-    Batch analyze GFP data only for multiple positions.
+    Batch analyze fluorescence traces (no chromatin segmentation) for multiple positions.
     --------------------------------------------------------------------
     INPUTS:
         positions: list, position identifiers
         analysis_paths: list, paths to analysis Excel files
         instance_paths: list, paths to instance movie files
         frame_interval_minutes: float, time between frames in minutes
+        version: Optional[str], suffix appended to output filenames
+        channels: Optional[list[str]], fluorescence channels to extract traces for; defaults to ['GFP']
     OUTPUTS:
         None (saves Excel files to disk)
     """
+
+    if channels is None:
+        channels = ["GFP"]
 
     for name_stub, analysis_path, instance_path in zip(
         positions,
@@ -391,33 +493,37 @@ def cycb_batch_analyze_nochrom(
 
         print(f"Working on position: {name_stub}")
 
-        (
-            intensity_traces,
-            semantic_traces,
-            frame_traces,
-            dead_traces,
-            cell_area_traces,
-            ids,
-            bkg_traces,
-            shading_traces,
-            offset_traces,
-            raw_intensity_traces
-        ) = retrieve_traces(
-            analysis_df,
-            "GFP",
-            int(frame_interval_minutes)
-        )
+        try:
+            (
+                intensity_traces,
+                semantic_traces,
+                frame_traces,
+                cell_area_traces,
+                ids,
+                bkg_traces,
+                shading_traces,
+                offset_traces,
+                raw_intensity_traces
+            ) = retrieve_traces(
+                analysis_df,
+                channels,
+                int(frame_interval_minutes)
+            )
+        except KeyError as err:
+            print(f"Skipping position {name_stub}: {err.args[0]} in {analysis_path}")
+            continue
+
+        channel_names = [output_column_names(wl) for wl in channels]
+        intensity_names = [names[key] for names in channel_names for key in ("intensity", "intensity_raw")]
+        correction_names = [names[key] for names in channel_names for key in ("bkg", "shading", "offset")]
 
         degradation_data = pd.DataFrame({
             "cell_id": [],
             "frame": [],
-            "cycb_intensity": [],
-            "cycb_intensity_raw": [],
+            **{col: [] for col in intensity_names},
             "semantic_smoothed": [],
             "cell_area": [],
-            "bkg": [],
-            "shading": [],
-            "offset": [],
+            **{col: [] for col in correction_names},
             "u_area": [],
             "u_area_intensity": [],
             "a_area": [],
@@ -434,10 +540,6 @@ def cycb_batch_analyze_nochrom(
 
         for i, cell_id in enumerate(ids):
 
-            num_dead_flags = np.sum(
-                semantic_traces[i] * dead_traces[i]
-            )
-
             time_in_mitosis = np.sum(
                 semantic_traces[i]
             )
@@ -446,19 +548,20 @@ def cycb_batch_analyze_nochrom(
 
             frames = frame_traces[i]
             n = len(frames)
+            intensity_cols, correction_cols = channel_trace_columns(
+                channels, i, intensity_traces, raw_intensity_traces,
+                bkg_traces, shading_traces, offset_traces
+            )
 
             nan_trace = [np.nan] * n
 
             cell_data = {
                 "cell_id": [cell_id] * n,
                 "frame": frames,
-                "cycb_intensity": intensity_traces[i],
-                "cycb_intensity_raw": raw_intensity_traces[i],
+                **intensity_cols,
                 "semantic_smoothed": semantic_traces[i],
                 "cell_area": cell_area_traces[i],
-                "bkg": bkg_traces[i],
-                "shading": shading_traces[i],
-                "offset": offset_traces[i],
+                **correction_cols,
                 "u_area": nan_trace,
                 "u_area_intensity": nan_trace,
                 "a_area": nan_trace,
@@ -482,7 +585,6 @@ def cycb_batch_analyze_nochrom(
                 "track_start": frames[0],
                 "track_end": frames[-1],
                 "plate_removal_freq": np.nan,
-                "num_dead_flags": num_dead_flags,
                 "time_in_mitosis": time_in_mitosis,
                 "ends_in_mitosis": ends_in_mitosis
             })
@@ -515,6 +617,19 @@ if __name__ == "__main__":
 
     root_dir = Path("/nfs/turbo/umms-ajitj/anishjv/cyclinb_analysis/20250621-cycb-noc")
 
+    # Fluorescence channels to extract traces for. GFP (Cyclin B) is required and keeps the
+    # legacy output columns; every other channel gets '{channel}_intensity', '{channel}_bkg', etc.
+    channels = ["GFP"]
+
+    # True: skip chromatin segmentation (writes *_cycb_only.xlsx).
+    # False: segment unaligned chromatin from the chromatin_channel movie (writes *_cycb_chromatin.xlsx).
+    cycb_only = False
+    chromatin_channel = "Texas Red"
+
+    if "GFP" not in channels:
+        print("channels must include 'GFP' (Cyclin B)")
+        sys.exit(1)
+
     inference_dirs = [
         obj.path
         for obj in os.scandir(root_dir)
@@ -525,8 +640,6 @@ if __name__ == "__main__":
     instance_paths = []
     chromatin_paths = []
     positions = []
-
-    has_chromatin = True
 
     for dir in inference_dirs:
 
@@ -540,23 +653,21 @@ if __name__ == "__main__":
         an_paths = glob.glob(f"{dir}/*analysis.xlsx")
         inst_paths = glob.glob(f"{dir}/*instance_movie.tif")
 
-        chrom_paths = [
-            path
-            for path in glob.glob(f"{root_dir}/*Texas Red.tif")
-            if str(name_stub + '_') in path
-        ]
-
-        # Detect whether chromatin exists globally
-        if len(chrom_paths) == 0:
-            has_chromatin = False
+        if not cycb_only:
+            chromatin_paths += [
+                path
+                for path in glob.glob(f"{root_dir}/*{chromatin_channel}.tif")
+                if str(name_stub + '_') in path
+            ]
 
         analysis_paths += an_paths
         instance_paths += inst_paths
-        chromatin_paths += chrom_paths
         positions.append(name_stub)
 
+    print(f"Channels: {channels}")
+
     # Run appropriate pipeline
-    if has_chromatin:
+    if not cycb_only:
 
         try:
             assert (
@@ -569,10 +680,10 @@ if __name__ == "__main__":
             print("Files to analyze not organized properly")
             print("Analysis paths", len(analysis_paths))
             print("Instance paths", len(instance_paths))
-            print("Chromatin paths", len(chromatin_paths))
+            print(f"Chromatin ({chromatin_channel}) paths", len(chromatin_paths))
             sys.exit(1)
 
-        print("Running chromatin-aware analysis")
+        print(f"Running chromatin-aware analysis (chromatin channel: {chromatin_channel})")
 
         cycb_chromatin_batch_analyze(
             positions,
@@ -580,7 +691,8 @@ if __name__ == "__main__":
             instance_paths,
             chromatin_paths,
             frame_interval_minutes=4.0,
-            version=version
+            version=version,
+            channels=channels
         )
 
     else:
@@ -594,15 +706,15 @@ if __name__ == "__main__":
             print("Instance paths", len(instance_paths))
             sys.exit(1)
 
-        print("No chromatin files detected")
-        print("Running CycB-only analysis")
+        print("Running CycB-only analysis (no chromatin segmentation)")
 
         cycb_batch_analyze_nochrom(
             positions,
             analysis_paths,
             instance_paths,
             frame_interval_minutes=4.0,
-            version=version
+            version=version,
+            channels=channels
         )
 
     """

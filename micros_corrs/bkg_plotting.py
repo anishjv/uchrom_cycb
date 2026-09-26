@@ -1,4 +1,5 @@
 import numpy as np
+import numpy.typing as npt
 import matplotlib.pyplot as plt
 import pandas as pd
 import seaborn as sns
@@ -13,6 +14,10 @@ import re
 import glob
 import math
 import sys
+from typing import Optional
+
+# Channel names as they appear in movie/map filenames (e.g. *_G04_s4_Texas Red.tif)
+CHANNELS = ["GFP", "Texas Red"]
 
 def measure_diagonal_network_path(img: np.ndarray, seg: np.ndarray, strip_width: int = 10):
     """
@@ -338,97 +343,132 @@ def plot_background_panels(
     return fig
 
 def process_movie(
-    gfp_path, seg_path, xlsx_path, 
-    bkg_map, intensity_map,
-    diagnostic_container # Dictionary to append lists for QC plots
+    channel_paths: dict[str, str],
+    seg_path: str,
+    xlsx_path: str,
+    channel_maps: dict[str, tuple[npt.NDArray, npt.NDArray]],
+    diagnostic_container: dict,
 ):
     """
-    Loads a single movie, calculates offsets for every frame, updates the analysis Excel file,
-    and extracts diagnostic data from the first frame.
+    Loads every channel of a single movie, calculates per-frame background offsets for each,
+    updates the analysis Excel file, and extracts diagnostic data from the first frame.
     ---------------------------------------------------------------------------------------------
     INPUTS:
-        gfp_path: str, Path to the GFP movie TIFF file.
+        channel_paths: dict[str, str], {channel name: path to that channel's movie TIFF file}.
         seg_path: str, Path to the segmentation movie TIFF file.
         xlsx_path: str, Path to the analysis results Excel file.
-        bkg_map: np.ndarray, 2D background maps.
-        intensity_map: np.ndarray, 2D intensity correction map.
+        channel_maps: dict[str, tuple[npt.NDArray, npt.NDArray]], {channel name: (bkg_map, intensity_map)}.
         diagnostic_container: dict, Shared dictionary to store plotting data from Frame 0.
     OUTPUTS:
-        None (Modifies the Excel file in place and updates diagnostic_container).
+        None (Writes one '{channel}_offset' column per channel to the Excel file in place
+        and updates diagnostic_container).
     """
-    
-    # Metadata
-    well_pos = re.search(r"[A-H]([1-9]|[0][1-9]|[1][0-2])_s(\d{2}|\d{1})", str(gfp_path)).group()
-    date = re.search(r"20\d{2}(0[1-9]|1[0-2])(0[1-9]|[12][0-9]|3[01])", str(gfp_path)).group()
+
+    # Metadata (identical across channels, so read it from any one path)
+    ref_path = str(next(iter(channel_paths.values())))
+    well_pos = re.search(r"[A-H]([1-9]|[0][1-9]|[1][0-2])_s(\d{2}|\d{1})", ref_path).group()
+    date = re.search(r"20\d{2}(0[1-9]|1[0-2])(0[1-9]|[12][0-9]|3[01])", ref_path).group()
     well = well_pos.split('_')[0]
     pos = well_pos.split('_')[1]
     date_well = f"{date}-{well}"
-    
+
     print(f"  Processing: {date_well} {pos}...")
 
-    # Load Images
-    gfp_stack = tif.imread(gfp_path)
     seg_stack = tif.imread(seg_path)
-    n_frames = gfp_stack.shape[0]
+    offsets_by_channel = {}
 
-    frame_offsets = {} 
-    for t in range(n_frames):
+    for channel, img_path in channel_paths.items():
+        bkg_map, intensity_map = channel_maps[channel]
+        img_stack = tif.imread(img_path)
+        n_frames = img_stack.shape[0]
 
-        img = gfp_stack[t]
-        seg = seg_stack[t] if len(seg_stack) > t else seg_stack[-1]
+        frame_offsets = {}
+        for t in range(n_frames):
 
-        if seg.shape != img.shape:
-            seg = resize(seg, img.shape, order=0, preserve_range=True, anti_aliasing=False).astype(seg.dtype)
-        
-        # Correction
-        corr_img = (img.astype(float) - bkg_map) / intensity_map
-        intensities, indices, is_valid, _ = measure_diagonal_network_path(corr_img, seg)
-        
-        # --- A. Offset Calculation (For Excel) ---
-        valid_pixels = intensities[is_valid]
-        if len(valid_pixels) > 0:
-            print(f'Offest sampled from {len(valid_pixels)} pixel values')
-            offset_val = np.mean(valid_pixels)
-        else:
-            print(f'{len(valid_pixels)} valid pixels found; setting offset to np.nan')
-            offset_val = np.nan
-        frame_offsets[t] = offset_val
-        
-        if t == 0:
-            num_points = len(intensities)
-            diagnostic_container['date_wells'].extend([date_well] * num_points)
-            diagnostic_container['pos'].extend([pos] * num_points)
-            diagnostic_container['intensities'].extend(intensities - offset_val)
-            diagnostic_container['indices'].extend(indices)
-            diagnostic_container['validity'].extend(is_valid)
+            img = img_stack[t]
+            seg = seg_stack[t] if len(seg_stack) > t else seg_stack[-1]
 
+            if seg.shape != img.shape:
+                seg = resize(seg, img.shape, order=0, preserve_range=True, anti_aliasing=False).astype(seg.dtype)
+
+            # Correction
+            corr_img = (img.astype(float) - bkg_map) / intensity_map
+            intensities, indices, is_valid, _ = measure_diagonal_network_path(corr_img, seg)
+
+            # --- A. Offset Calculation (For Excel) ---
+            valid_pixels = intensities[is_valid]
+            if len(valid_pixels) > 0:
+                print(f'[{channel}] Offset sampled from {len(valid_pixels)} pixel values')
+                offset_val = np.mean(valid_pixels)
+            else:
+                print(f'[{channel}] {len(valid_pixels)} valid pixels found; setting offset to np.nan')
+                offset_val = np.nan
+            frame_offsets[t] = offset_val
+
+            if t == 0:
+                num_points = len(intensities)
+                diagnostic_container['channel'].extend([channel] * num_points)
+                diagnostic_container['date_wells'].extend([date_well] * num_points)
+                diagnostic_container['pos'].extend([pos] * num_points)
+                diagnostic_container['intensities'].extend(intensities - offset_val)
+                diagnostic_container['indices'].extend(indices)
+                diagnostic_container['validity'].extend(is_valid)
+
+        offsets_by_channel[channel] = frame_offsets
+
+    # Single read/write per movie so channels don't clobber each other's columns
     df = pd.read_excel(xlsx_path, engine='openpyxl')
     if 'frame' in df.columns:
-        df['offset'] = df['frame'].map(frame_offsets)
+        for channel, frame_offsets in offsets_by_channel.items():
+            df[f'{channel}_offset'] = df['frame'].map(frame_offsets)
         df.to_excel(xlsx_path, index=False, engine='openpyxl')
+
+
+def load_channel_maps(root_dir_path: str, channel: str) -> Optional[tuple[npt.NDArray, npt.NDArray]]:
+    """
+    Loads the background and intensity (shading) maps for one channel.
+    ---------------------------------------------------------------------------------------------
+    INPUTS:
+        root_dir_path: str, Directory containing '*_{channel}_background_map.tif' and
+            '*_{channel}_intensity_map.tif'.
+        channel: str, Channel name as it appears in the filename (e.g. 'GFP', 'Texas Red').
+    OUTPUTS:
+        maps: tuple (bkg_map, intensity_map), or None if either map is missing.
+    """
+    bkg_files = sorted(glob.glob(f"{root_dir_path}/*_{channel}_background_map.tif"))
+    int_files = sorted(glob.glob(f"{root_dir_path}/*_{channel}_intensity_map.tif"))
+    if len(bkg_files) == 0 or len(int_files) == 0:
+        return None
+    if len(bkg_files) > 1 or len(int_files) > 1:
+        print(f"WARNING: multiple {channel} maps found; using {bkg_files[0]} and {int_files[0]}")
+
+    intensity_map = tif.imread(int_files[0])
+    if intensity_map.ndim == 3: intensity_map = intensity_map[0]
+    bkg_map = tif.imread(bkg_files[0])
+    return bkg_map, intensity_map
 
 
 def main():
     # --- Config ---
     root_dir_path = "/nfs/turbo/umms-ajitj/anishjv/cyclinb_analysis/20251028-cycb-gsk"
-    gfp_dir_path = "/nfs/turbo/umms-ajitj/anishjv/cyclinb_analysis/20251028-cycb-gsk"
-    
+    img_dir_path = "/nfs/turbo/umms-ajitj/anishjv/cyclinb_analysis/20251028-cycb-gsk"
+
 
     print("Loading Maps...")
-    try:
-        intensity_map = tif.imread(glob.glob(f"{root_dir_path}/*intensity_map.tif")[0])
-        if intensity_map.ndim == 3: intensity_map = intensity_map[0]
-        bkg_map_stack = tif.imread(glob.glob(f"{root_dir_path}/*background_map.tif")[0])
-    except IndexError:
-        print("CRITICAL: Maps not found.")
-        sys.exit(1)
+    channel_maps = {}
+    for channel in CHANNELS:
+        maps = load_channel_maps(root_dir_path, channel)
+        if maps is None:
+            print(f"CRITICAL: Maps not found for {channel}.")
+            sys.exit(1)
+        channel_maps[channel] = maps
 
     root_dir = Path(root_dir_path)
     inference_dirs = [obj.path for obj in os.scandir(root_dir) if "_inference" in obj.name and obj.is_dir()]
-    
+
     # Container for plotting data
     qc_data = {
-        'date_wells': [], 'pos': [], 'intensities': [], 'indices': [], 'validity': []
+        'channel': [], 'date_wells': [], 'pos': [], 'intensities': [], 'indices': [], 'validity': []
     }
 
     print(f"Found {len(inference_dirs)} inference directories.")
@@ -437,43 +477,57 @@ def main():
         name_stub_match = re.search(r"[A-H]([1-9]|[0][1-9]|[1][0-2])_s(\d{2}|\d{1})", str(dir_path))
         if not name_stub_match: continue
         name_stub = name_stub_match.group()
-        
-        seg_files = glob.glob(f"{dir_path}/*semantic_movie.tif")
+
+        seg_files = glob.glob(f"{dir_path}/*semantic.tif")
         xlsx_files = glob.glob(f"{dir_path}/*analysis.xlsx")
         name_stub_prefix = str(name_stub) + "_"
-        gfp_files = [p for p in glob.glob(f"{gfp_dir_path}/*GFP.tif") if str(name_stub_prefix) in p]
+        channel_files = {
+            channel: [p for p in glob.glob(f"{img_dir_path}/*_{channel}.tif") if name_stub_prefix in p]
+            for channel in CHANNELS
+        }
 
-        if len(seg_files) == 1 and len(gfp_files) == 1 and len(xlsx_files) == 1:
+        if len(seg_files) == 1 and len(xlsx_files) == 1 and all(len(v) == 1 for v in channel_files.values()):
             process_movie(
-                gfp_files[0], seg_files[0], xlsx_files[0],
-                bkg_map_stack, intensity_map, qc_data
+                {channel: paths[0] for channel, paths in channel_files.items()},
+                seg_files[0], xlsx_files[0],
+                channel_maps, qc_data
             )
         else:
             print(f"Skipping {name_stub}: Files incomplete.")
 
     print("Generating Diagnostic Plots...")
     df_background_qc = pd.DataFrame({
+        "channel": qc_data['channel'],
         "date-well": qc_data['date_wells'],
         "pos": qc_data['pos'],
         "intensities": qc_data['intensities'],
         "indices": qc_data['indices'],
         "validity": qc_data['validity']
     })
-    
-    if not df_background_qc.empty:
-        # Intra-Well Variance (Stage Stability)
-        fig1 = plot_background_panels(df_background_qc, mode='intra-well', cols=3, bin_width=50)
-        fig1.savefig(f'{root_dir_path}/qc_intra_well.png', dpi=300)
-        plt.close(fig1)
-        
-        # Inter-Well Variance (Batch Consistency)
-        fig2 = plot_background_panels(df_background_qc, mode='inter-well', cols=3, bin_width=50)
-        fig2.savefig(f'{root_dir_path}/qc_inter_well.png', dpi=300)
-        plt.close(fig2)
-        
-        print("Done. Plots saved.")
-    else:
+
+    if df_background_qc.empty:
         print("No valid background data collected for plotting.")
+        return
+
+    for channel in CHANNELS:
+        df_channel = df_background_qc[df_background_qc["channel"] == channel]
+        if df_channel.empty:
+            continue
+        channel_tag = channel.replace(" ", "_")
+
+        # Intra-Well Variance (Stage Stability)
+        fig1 = plot_background_panels(df_channel, mode='intra-well', cols=3, bin_width=50)
+        fig1.suptitle(channel)
+        fig1.savefig(f'{root_dir_path}/qc_intra_well_{channel_tag}.png', dpi=300)
+        plt.close(fig1)
+
+        # Inter-Well Variance (Batch Consistency)
+        fig2 = plot_background_panels(df_channel, mode='inter-well', cols=3, bin_width=50)
+        fig2.suptitle(channel)
+        fig2.savefig(f'{root_dir_path}/qc_inter_well_{channel_tag}.png', dpi=300)
+        plt.close(fig2)
+
+    print("Done. Plots saved.")
 
 if __name__ == "__main__":
     main()
